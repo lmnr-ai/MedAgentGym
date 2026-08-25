@@ -225,9 +225,15 @@ Things worth knowing before the first run:
   loads them. Use keys scoped to this work. Only the keys listed in `FORWARDED_KEYS` are
   sent, and they go in as a file rather than as sandbox environment variables.
 - **`--with-fhir` makes the FHIR sandbox public** for the life of the run, since the worker
-  sandboxes have to reach it over its preview URL and hold no Daytona token. That path is
-  untested — it could not be exercised from an environment without Docker, which is the
-  reason it exists. Everything else in the script is exercised by the local flow.
+  sandboxes have to reach it over its preview URL and hold no Daytona token. It serves only
+  MedAgentBench's synthetic patients, but it is world-reachable while the run lasts, and
+  writes from one shard are visible to every other shard exactly as they are under
+  `docker run`. It comes up in ~2 minutes and is torn down with the workers.
+- **The FHIR sandbox is built from `Dockerfile.fhir`, not from `jyxsu6/medagentbench`
+  directly.** That image is distroless — no shell, no coreutils — so Daytona's agent has
+  nothing to run inside it and every exec fails with `failed to resolve container IP` even
+  though the sandbox reports `STARTED`. `Dockerfile.fhir` lifts its `/app`, `/configs` and
+  `/data` onto a JRE base; nothing is uploaded from your checkout to build it.
 - **BioDSBench study data is fetched inside each sandbox** (~160 MB per sandbox), because
   it is gitignored and so not in the clone.
 

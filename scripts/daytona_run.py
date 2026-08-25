@@ -7,8 +7,9 @@ Three problems this solves that a local run does not:
   the agent `pip install` into the venv it is being graded in. A sandbox is
   thrown away afterwards, so every rollout starts from the same clean tree.
 * **Docker.** MedAgentBench needs the HAPI FHIR server that upstream starts with
-  `docker run -p 8080:8080`. Here that image is a *sandbox of its own*, reached
-  over its preview URL, so no Docker daemon is needed anywhere -- `--with-fhir`.
+  `docker run -p 8080:8080`. Here it is a *sandbox of its own* (built from
+  `Dockerfile.fhir`), reached over its preview URL, so no Docker daemon is
+  needed anywhere -- `--with-fhir`.
 * **Throughput.** Task indices are sharded across sandboxes, each running its
   shard with joblib, so total concurrency is `--sandboxes` x `--n-jobs`. Rate
   limits, not CPU, are usually what caps this.
@@ -48,6 +49,8 @@ import sys
 import tarfile
 import textwrap
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -69,7 +72,6 @@ REMOTE_REPO = "/home/MedAgentGym"
 # scratch in every sandbox.
 REMOTE_VENV = "/home/.venv"
 DEFAULT_REPO_URL = "https://github.com/lmnr-ai/MedAgentGym.git"
-FHIR_IMAGE = "jyxsu6/medagentbench:latest"
 FHIR_PORT = 8080
 # What `--ref` has to look like to be treated as a commit rather than a branch.
 # `git.clone` takes the two on different keyword arguments and the server clones
@@ -236,45 +238,67 @@ def run_detached(sandbox, argv: list[str], timeout: int, label: str) -> int:
 def start_fhir_sandbox(client: Daytona, args: argparse.Namespace):
     """Bring up MedAgentBench's FHIR server as its own sandbox.
 
-    This path is *unverified*: it was written in an environment with neither a
-    Daytona key nor Docker, which is the reason it exists at all. The shape is
-    upstream's `data/medagentbench/start_eval_docker.sh` with `docker run`
-    replaced by a sandbox and the published port replaced by a preview URL.
+    This replaces upstream's `data/medagentbench/start_eval_docker.sh`: the
+    `docker run` becomes a sandbox and the published port becomes a preview URL.
 
     The sandbox is public because the workers have to reach it and carry no
     Daytona token; it holds only MedAgentBench's synthetic patients, but it is
     world-reachable for the life of the run.
     """
-    print(f"[fhir] creating sandbox from {FHIR_IMAGE} ...")
+    print("[fhir] building sandbox image from Dockerfile.fhir ...")
     sandbox = client.create(
         CreateSandboxFromImageParams(
-            image=FHIR_IMAGE,
+            image=Image.from_dockerfile(REPO_DIR / "Dockerfile.fhir"),
             public=True,
             os_user="root",
             labels={"medagentgym": "fhir"},
-            resources=Resources(cpu=2, memory=4, disk=10),
+            # HAPI is a JVM holding a ~1.4 GB H2 database open, so it wants more
+            # RAM than a worker; 10 GB of disk is the per-sandbox ceiling on the
+            # default Daytona plan and is enough for the image.
+            resources=Resources(cpu=4, memory=8, disk=10),
             auto_stop_interval=0,
             ttl_minutes=args.timeout // 60 + 60,
         ),
-        timeout=900,
+        timeout=1800,
     )
-    # Daytona replaces the image's entrypoint with its own agent, so whatever
-    # the image would have run on start has to be started by hand.
-    sandbox.process.exec("nohup /entrypoint.sh > /tmp/fhir.log 2>&1 & echo started", timeout=60)
-    url = sandbox.get_preview_link(FHIR_PORT).url.rstrip("/") + "/fhir/"
-    print(f"[fhir] waiting for {url} ...")
-    for _ in range(60):
-        probe = sandbox.process.exec(
-            f"curl -s -o /dev/null -w '%{{http_code}}' {url}metadata", timeout=60
+    try:
+        # Daytona replaces the image's entrypoint with its own agent, so the war
+        # has to be launched by hand -- with the argv the original image had as
+        # its entrypoint, since that is what wires the loader path to the war.
+        sandbox.process.exec(
+            "nohup java --class-path /app/main.war "
+            "'-Dloader.path=main.war!/WEB-INF/classes/,main.war!/WEB-INF/,/app/extra-classes' "
+            "org.springframework.boot.loader.PropertiesLauncher "
+            "> /tmp/fhir.log 2>&1 & echo started",
+            cwd="/app",
+            timeout=60,
         )
-        if (probe.result or "").strip() == "200":
-            print(f"[fhir] ready at {url}")
-            return sandbox, url
-        time.sleep(10)
-    raise RuntimeError(
-        f"FHIR server did not answer at {url} within 10 minutes. Re-run with "
-        f"--keep-sandboxes and read /tmp/fhir.log in the sandbox."
-    )
+        url = sandbox.get_preview_link(FHIR_PORT).url.rstrip("/") + "/fhir/"
+        print(f"[fhir] waiting for {url} ...")
+        # Polled from here rather than with a `curl` inside the sandbox: this is
+        # the same public preview URL the workers will use, so a 200 here proves
+        # the path that actually matters, and the JRE image has no curl anyway.
+        for _ in range(90):
+            time.sleep(10)
+            try:
+                with urllib.request.urlopen(f"{url}metadata", timeout=30) as resp:
+                    if resp.status == 200:
+                        print(f"[fhir] ready at {url}")
+                        return sandbox, url
+            except (urllib.error.URLError, TimeoutError, OSError):
+                pass
+        tail = sandbox.process.exec("tail -40 /tmp/fhir.log", timeout=60)
+        raise RuntimeError(
+            f"FHIR server did not answer at {url} within 15 minutes.\n{tail.result}"
+        )
+    except BaseException:
+        # The caller only learns about this sandbox if this function returns, so
+        # anything that escapes has to take the sandbox with it or it leaks --
+        # a stopped-but-billed container nobody has a handle on.
+        if not args.keep_sandboxes:
+            print("[fhir] startup failed, deleting sandbox")
+            client.delete(sandbox)
+        raise
 
 
 def provision(client: Daytona, image, args: argparse.Namespace, creds: dict[str, str], label: str):

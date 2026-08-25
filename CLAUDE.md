@@ -123,9 +123,20 @@ flags. The non-obvious parts:
 - `MEDAGENTBENCH_FHIR_URL` overrides `http://localhost:8080/fhir/` in
   `env/task/medagentbench.py`. The prompt's example URL is built from the same value —
   they must not drift, or the agent POSTs to localhost while the server is elsewhere.
-- The `--with-fhir` path (FHIR server as its own public sandbox, reached over
-  `get_preview_link(8080)`) is **untested**; it was written in an environment with neither
-  Docker nor a Daytona key.
+- **`--with-fhir` needs `Dockerfile.fhir`; `jyxsu6/medagentbench` cannot be a sandbox on
+  its own.** That image is distroless (no shell, no `sleep`, uid 65532), so Daytona's agent
+  has nothing to exec into: `create()` succeeds, the sandbox reports `SandboxState.STARTED`
+  with `error_reason=None`, and every `process.exec` fails with `failed to resolve container
+  IP after 3 attempts`. Overriding the entrypoint does not help — there is no `sleep` binary
+  either. `Dockerfile.fhir` copies its `/app` (the HAPI war), `/configs` and `/data` (a
+  ~1.4 GB H2 database) onto `eclipse-temurin:17-jre-jammy` in a multi-stage build, so no
+  build context is uploaded, and the driver starts the war by hand with the argv that was
+  the original image's `ENTRYPOINT`. Ready in ~2 minutes; wants 8 GB of RAM, and 10 GB of
+  disk is the per-sandbox ceiling on the default plan (a 30 GB request is a 400).
+- Readiness is polled from the *driver* against the public preview URL rather than with a
+  `curl` inside the sandbox: that is the path the workers use, and the JRE image has no
+  `curl`. `start_fhir_sandbox` deletes its own sandbox on any failure — the caller only
+  gets the handle if it returns, so anything that escapes would leak a running container.
 
 ## Grading, per dataset (all execution-based; there is no LLM-as-a-judge anywhere)
 
