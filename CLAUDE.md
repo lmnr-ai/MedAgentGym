@@ -27,6 +27,8 @@ Only four datasets remain: `biocoder`, `biodsbench`, `medagentbench`, `medcalcbe
 - `scripts/` — one-off maintenance: `fetch_biodsbench_data.py` downloads the study data,
   `filter_biocoder.py` / `filter_biodsbench.py` drop ungradable rows and rewrite
   `data/metadata.json`. Shared subprocess helpers live in `scripts/_common.py`.
+  `daytona_run.py` is the odd one out: it is a *driver*, run on a dev machine, and the
+  only thing in the repo that needs the `daytona` extra — see below.
 - `ehr_gym/llm/chat_api.py` — Azure Foundry / Azure OpenAI / OpenAI clients only. No local
   model serving. `make_chat_model(config)` is the single constructor; `MODEL_ARGS` maps
   `model_type` to the args dataclass, and only fields the dataclass declares are passed
@@ -76,19 +78,54 @@ Only four datasets remain: `biocoder`, `biodsbench`, `medagentbench`, `medcalcbe
 
 ## Tracing
 
-Every rollout is a Laminar trace (root span `<task>[<mode>/<idx>]`, session =
-`result_dir_tag`), with `step N` → `agent.act` → `openai.chat` and a sibling `env.<action>`
-span carrying the reward. Two things are easy to get wrong:
+Every rollout is a Laminar trace: root span `<task>[<mode>/<idx>]` (session =
+`result_dir_tag`), and directly under it a flat alternating sequence of `openai.chat` and
+`env.<action>` spans. **Trajectory consumers want that flat shape**, so do not reintroduce
+per-step or per-`act` wrapper spans; the only span the harness opens by hand is the root
+one in `run_single_rollout` and the `env.<action>` one in `EHREnv.step`. Two things are
+easy to get wrong:
 
 - joblib `prefer="processes"` workers do **not** inherit the parent's tracer provider, so
   `tracing.initialize()` runs inside `run_single_experiment`, not in `main()`.
 - A worker can exit without running interpreter shutdown hooks, so every rollout ends in a
   `tracing.flush()`.
 
-Production `api.lmnr.ai` does not expose `/v1/sql/query` or `/v1/projects/current`, so
-traces cannot be read back programmatically to confirm delivery. The working check is
-differential: a bogus key logs `Failed to export traces to api.lmnr.ai:8443, error code:
-StatusCode.UNAUTHENTICATED` and a good key logs nothing.
+To confirm delivery, read the spans back with `LaminarClient(project_api_key=...).sql.query`
+— e.g. `SELECT name, span_id, parent_span_id, path FROM spans WHERE trace_id = '...'`.
+Root spans have `parent_span_id = '00000000-0000-0000-0000-000000000000'`. This needs a
+key with **read** scope; a write-only key 404s on `/v1/sql/query` and
+`/v1/projects/current`, which looks exactly like the routes not existing. The check that
+works with any key is differential: a bogus key logs `Failed to export traces to
+api.lmnr.ai:8443, error code: StatusCode.UNAUTHENTICATED` and a good key logs nothing.
+
+## Daytona
+
+`scripts/daytona_run.py` shards a run across Daytona sandboxes; the README documents the
+flags. The non-obvious parts:
+
+- **`Dockerfile.daytona` exists because the SDK has no `.dockerignore` support.**
+  `Image.from_dockerfile` parses `COPY` sources and uploads them as build context, so the
+  repo `Dockerfile`'s `COPY . /home/` would ship `.venv`, `workdir/` and `credentials.toml`
+  to a remote builder. `Dockerfile.daytona` copies only `pyproject.toml`, `uv.lock` and
+  `.python-version`; the code arrives per sandbox via `git.clone` at a pinned ref.
+  `COPY --from=` lines are skipped by that parser, so the uv stage is safe.
+- The image builds the venv at `/home/.venv` with `--no-install-project`, and the clone
+  lands beside it at `/home/MedAgentGym`, so the per-sandbox `uv sync` is nearly a no-op.
+  Commands must run `/home/.venv/bin/python` and set `UV_PROJECT_ENVIRONMENT`, not rely on
+  the image's `ENV` surviving into Daytona's exec.
+- Credentials are uploaded as a `credentials.toml`, not passed as `env_vars`, so they stay
+  out of sandbox metadata. `set_environment_variables()` exports every key of that file,
+  which is also how `MEDAGENTBENCH_FHIR_URL` reaches the task module.
+- A shard is started with `nohup` and polled for `/tmp/exit_code` rather than run as one
+  long `exec`: a multi-hour HTTP response is at the mercy of every proxy in between.
+  Sandboxes are created with `auto_stop_interval=0` (the 15-minute idle timer would stop a
+  silent shard) and a `ttl_minutes` backstop for a driver that dies before cleanup.
+- `MEDAGENTBENCH_FHIR_URL` overrides `http://localhost:8080/fhir/` in
+  `env/task/medagentbench.py`. The prompt's example URL is built from the same value —
+  they must not drift, or the agent POSTs to localhost while the server is elsewhere.
+- The `--with-fhir` path (FHIR server as its own public sandbox, reached over
+  `get_preview_link(8080)`) is **untested**; it was written in an environment with neither
+  Docker nor a Daytona key.
 
 ## Grading, per dataset (all execution-based; there is no LLM-as-a-judge anywhere)
 
@@ -121,8 +158,9 @@ StatusCode.UNAUTHENTICATED` and a good key logs nothing.
   `data/biodsbench/data/<study_id>/`; tasks span 11 studies that reuse the same ten
   filenames, so the per-study subdirectory matters. Both `data_*.txt` (raw cBioPortal TSV)
   and `data_*.csv` are written — a few tasks read the `.txt`.
-- **MedAgentBench** (240 train / 60 test) — needs a live HAPI FHIR server on
-  `http://localhost:8080/fhir/` (`bash data/medagentbench/start_eval_docker.sh`). 54/60
+- **MedAgentBench** (240 train / 60 test) — needs a live HAPI FHIR server, by default on
+  `http://localhost:8080/fhir/` (`bash data/medagentbench/start_eval_docker.sh`), or
+  wherever `MEDAGENTBENCH_FHIR_URL` points. 54/60
   test rows have an empty `sol` and are graded by programmatic `task1..task10` graders that
   query the server. Tasks 3/5/8/9/10 mutate server state, so restart between full runs.
 - **MedCalcBench** (1047 test, no train split) — self-contained. 55 of the 57 calculators

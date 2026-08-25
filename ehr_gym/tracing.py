@@ -4,9 +4,14 @@ Trajectories are the product of this fork, so every rollout is also a Laminar
 trace:
 
     <task>[<mode>/<idx>]          root span, one per trajectory
-      agent.act                   one per step; the LLM call hangs off it
-        openai.chat               from the SDK's OpenAI auto-instrumentation
+      openai.chat                 from the SDK's OpenAI auto-instrumentation
       env.validate_code           the action the agent chose, and its reward
+      openai.chat                 the next turn, and so on
+
+The two span kinds are deliberately siblings under the trajectory rather than
+being nested under per-step wrappers: a trajectory then reads as one flat
+alternating sequence of "what the model said" and "what the environment did",
+which is the shape trajectory consumers expect.
 
 Tracing is optional: with no `LMNR_PROJECT_API_KEY` in the environment the SDK
 is never initialized and every `Laminar.*` call in the harness degrades to a

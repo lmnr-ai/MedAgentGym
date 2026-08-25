@@ -78,6 +78,9 @@ Per-dataset notes:
   `UserWarning` scored 0. Rewards now come from stdout alone, which is what
   `scripts/filter_biocoder.py` picked the keep set with; the agent is still shown stderr.
 - Every rollout is traced to [Laminar](https://www.lmnr.ai/) — see *Tracing* below.
+- `scripts/daytona_run.py` runs a sharded experiment on Daytona sandboxes, which gives
+  agent-generated code a throwaway machine and removes the Docker prerequisite for
+  MedAgentBench — see *Running on Daytona* below.
 
 ### Setup
 
@@ -156,11 +159,14 @@ trace; leave it unset and the SDK is never initialized, so nothing else changes.
 
 ```
 <task>[<mode>/<idx>]          root span, one per trajectory, session = result_dir_tag
-  step 0
-    agent.act                 the prompt the agent saw and the action it chose
-      openai.chat             from the SDK's OpenAI auto-instrumentation
-    env.validate_code         the action's arguments, its reward, and the feedback
+  openai.chat                 from the SDK's OpenAI auto-instrumentation
+  env.validate_code           the action's arguments, its reward, and the feedback
+  openai.chat                 the next turn, and so on
 ```
+
+The two span kinds are deliberately siblings rather than nested under per-step wrappers,
+so a trajectory reads as one flat alternating sequence of "what the model said" and "what
+the environment did".
 
 Rollouts run in joblib worker *processes*, which do not inherit the parent's tracer
 provider, so `ehr_gym/tracing.py` initializes inside the worker and flushes after every
@@ -175,6 +181,55 @@ runtime and no `torch`.
 bash build_docker.sh
 TASK_NAME=biocoder N_JOBS=5 bash run_docker.sh
 ```
+
+### Running on Daytona
+
+`scripts/daytona_run.py` shards a run across [Daytona](https://www.daytona.io/) sandboxes.
+Worth doing for three reasons: agent-generated code gets a throwaway machine instead of
+your checkout, MedAgentBench's FHIR server becomes a sandbox instead of a `docker run`,
+and the work is spread over `--sandboxes × --n-jobs` concurrent rollouts.
+
+```bash
+uv sync --extra daytona
+export DAYTONA_API_KEY=...
+
+uv run python scripts/daytona_run.py --task biocoder --sandboxes 4 --n-jobs 2
+```
+
+What it does per sandbox: build (or reuse) the image from `Dockerfile.daytona`, `git clone`
+the repo at `--ref`, `uv sync --locked --extra tasks`, upload your `credentials.toml` and a
+`shard.json` of that sandbox's task indices, run `main.py --rollout_indices_path shard.json`,
+then download the `workdir/` tree and delete the sandbox.
+
+| Flag | Meaning |
+| --- | --- |
+| `--sandboxes N` | how many sandboxes to shard the indices across (round-robin) |
+| `--n-jobs N` | joblib workers *inside* each sandbox |
+| `--ref` | branch, tag or commit to clone (default `main`) — this is what pins the run |
+| `--indices-path` | run a fixed index list, e.g. `data/smoke_indices.json` |
+| `--snapshot NAME` | reuse a prebuilt Daytona snapshot instead of building the Dockerfile |
+| `--with-fhir` | start MedAgentBench's FHIR server as its own sandbox |
+| `--keep-sandboxes` | leave sandboxes running so a failure can be inspected |
+
+Things worth knowing before the first run:
+
+- **`--ref` is the version that runs**, not your working tree. Push your branch first, or
+  the sandboxes will run `main`.
+- **`Dockerfile.daytona` is not `Dockerfile`.** The Daytona SDK reads `COPY` sources
+  directly and has no `.dockerignore` support, so the repo `Dockerfile`'s `COPY . /home/`
+  would upload your `.venv`, `workdir/` and `credentials.toml` into a remote image build.
+  The Daytona image carries only the dependency environment; the code arrives via `git`.
+  It only needs rebuilding when `uv.lock` changes — pass `--snapshot` to skip the build
+  entirely once you have one.
+- **Your credentials are copied into every sandbox**, because that file is how the harness
+  loads them. Use keys scoped to this work. Only the keys listed in `FORWARDED_KEYS` are
+  sent, and they go in as a file rather than as sandbox environment variables.
+- **`--with-fhir` makes the FHIR sandbox public** for the life of the run, since the worker
+  sandboxes have to reach it over its preview URL and hold no Daytona token. That path is
+  untested — it could not be exercised from an environment without Docker, which is the
+  reason it exists. Everything else in the script is exercised by the local flow.
+- **BioDSBench study data is fetched inside each sandbox** (~160 MB per sandbox), because
+  it is gitignored and so not in the clone.
 
 ## Results
 

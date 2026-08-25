@@ -35,7 +35,14 @@ class MedAgentBenchTask(AbstractEHRTask):
     ) -> None:
         super().__init__(task_id=task_id)
         self.task_id = task_id
-        self.fhir_api_base = "http://localhost:8080/fhir/"
+        # The server is a container the caller starts. It is on localhost when
+        # that container runs beside the harness, but under Daytona it is a
+        # separate sandbox reached over its preview URL, so the address has to
+        # be configurable. The trailing slash is load-bearing: every call site
+        # builds URLs as f"{fhir_api_base}Patient?...".
+        self.fhir_api_base = os.getenv("MEDAGENTBENCH_FHIR_URL", "http://localhost:8080/fhir/")
+        if not self.fhir_api_base.endswith("/"):
+            self.fhir_api_base += "/"
         self.task_list = None
         self.func_json_path = os.path.join(data_path, "funcs_v1.json")
         self.data_path = data_path
@@ -106,8 +113,15 @@ class MedAgentBenchTask(AbstractEHRTask):
         """
         super().setup_goal()
         # get the task configuration
-        answer_format = """answer = {"GET": ["60","S2874099"], "POST": ["http://localhost:8080/fhir/Observation", "payload]}
-The answers to the questions are listed in "GET" instead of the get commands, while the post url and payload are listed in "POST"."""
+        # The example URL has to match the server the agent is actually told to
+        # use, or it will POST to localhost while the server lives elsewhere.
+        answer_format = (
+            'answer = {"GET": ["60","S2874099"], "POST": ["'
+            + self.fhir_api_base
+            + 'Observation", "payload]}\n'
+            'The answers to the questions are listed in "GET" instead of the get commands, '
+            'while the post url and payload are listed in "POST".'
+        )
         self.goal = f"""You are an expert in using FHIR functions to assist medical professionals.
 {self.fhir_overall_information}
 

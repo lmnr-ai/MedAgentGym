@@ -124,21 +124,20 @@ def _rollout(args, config, idx, output_path):
     steps = 0
     for step in range(args.num_steps):
         steps = step + 1
-        with Laminar.start_as_current_span(f"step {step}"):
+        action, params = agent.act(obs)
+        while action.startswith(LLM_FAILURE):
+            logger.error(
+                f"Task {args.task}-{idx} failure: agent action failed "
+                f"for {agent_config['n_retry']} times."
+            )
+            attempts += 1
+            if attempts >= config["Env"]["n_retry"]:
+                agent.conversation_history.append({"result": "failure"})
+                save_conversation_history(agent.conversation_history, output_path)
+                return {"success": 0, "score": 0, "steps": steps, "reason": action}
+            time.sleep(1)
             action, params = agent.act(obs)
-            while action.startswith(LLM_FAILURE):
-                logger.error(
-                    f"Task {args.task}-{idx} failure: agent action failed "
-                    f"for {agent_config['n_retry']} times."
-                )
-                attempts += 1
-                if attempts >= config["Env"]["n_retry"]:
-                    agent.conversation_history.append({"result": "failure"})
-                    save_conversation_history(agent.conversation_history, output_path)
-                    return {"success": 0, "score": 0, "steps": steps, "reason": action}
-                time.sleep(1)
-                action, params = agent.act(obs)
-            obs, reward, done, _, _ = env.step(action, **params)
+        obs, reward, done, _, _ = env.step(action, **params)
         if done:
             break
 

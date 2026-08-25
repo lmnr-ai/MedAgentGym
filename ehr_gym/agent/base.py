@@ -1,8 +1,6 @@
 import time
 from typing import Any
 
-from lmnr import Laminar
-
 from ehr_gym.agent.parser import parse_llm_response
 from ehr_gym.agent.prompt import DynamicPrompt
 from ehr_gym.llm.chat_api import (
@@ -67,28 +65,26 @@ class EHRAgent:
         if self.conversation_history[-1] != user_msg:
             self.conversation_history.append(user_msg)
 
-        with Laminar.start_as_current_span("agent.act", input=user_msg["content"]):
-            for _ in range(self.agent_config["n_retry"]):
-                try:
-                    response, cost = self.llm(self.conversation_history)
-                    response = response.content
-                    self.cost.append(cost)
-                except Exception as e:
-                    print("Error Message ", e)
-                    time.sleep(self.agent_config["retry_delay"])
-                    action, params = f"{LLM_FAILURE}: {e}", {}
-                    continue
-                try:
-                    action, params = self.parser(response)
-                except Exception as e:
-                    print("Error Message ", e)
-                    action, params = f"{PARSE_FAILURE}: {e}", {}
-                # The response goes in verbatim even when it did not parse: the
-                # environment feeds the parse error back as the next user turn,
-                # and that only reads as a correction if the turn it corrects is
-                # actually in the transcript.
-                self.conversation_history.append(make_assistant_message(content=response))
-                break
-            Laminar.set_span_output({"action": action, "params": params})
+        for _ in range(self.agent_config["n_retry"]):
+            try:
+                response, cost = self.llm(self.conversation_history)
+                response = response.content
+                self.cost.append(cost)
+            except Exception as e:
+                print("Error Message ", e)
+                time.sleep(self.agent_config["retry_delay"])
+                action, params = f"{LLM_FAILURE}: {e}", {}
+                continue
+            try:
+                action, params = self.parser(response)
+            except Exception as e:
+                print("Error Message ", e)
+                action, params = f"{PARSE_FAILURE}: {e}", {}
+            # The response goes in verbatim even when it did not parse: the
+            # environment feeds the parse error back as the next user turn,
+            # and that only reads as a correction if the turn it corrects is
+            # actually in the transcript.
+            self.conversation_history.append(make_assistant_message(content=response))
+            break
 
         return action, params

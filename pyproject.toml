@@ -19,6 +19,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Only `scripts/daytona_run.py` needs this, and only on the machine driving the
+# run -- never inside a sandbox, which is why it is not in `tasks`.
+daytona = [
+    "daytona>=0.207.0",
+]
 # Installed into the same environment as the harness because `validate_code`
 # executes the agent's code with the interpreter of the active venv -- and
 # because BioCoder's ground truth is the stdout of its reference program, so a

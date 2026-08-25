@@ -1,0 +1,412 @@
+"""Run a MedAgentGym experiment across parallel Daytona sandboxes.
+
+Three problems this solves that a local run does not:
+
+* **Isolation.** `validate_code` runs agent-generated code with the harness's own
+  interpreter and `cwd`, so a local run leaves stray files in the repo and lets
+  the agent `pip install` into the venv it is being graded in. A sandbox is
+  thrown away afterwards, so every rollout starts from the same clean tree.
+* **Docker.** MedAgentBench needs the HAPI FHIR server that upstream starts with
+  `docker run -p 8080:8080`. Here that image is a *sandbox of its own*, reached
+  over its preview URL, so no Docker daemon is needed anywhere -- `--with-fhir`.
+* **Throughput.** Task indices are sharded across sandboxes, each running its
+  shard with joblib, so total concurrency is `--sandboxes` x `--n-jobs`. Rate
+  limits, not CPU, are usually what caps this.
+
+The repo is cloned into each sandbox at a pinned ref rather than uploaded, so a
+run is reproducible from a commit and nothing local leaks into the image.
+
+Credentials are read from the local `credentials.toml` and written into each
+sandbox, because that file is how the harness loads them. They therefore leave
+this machine: use keys scoped to this work. `--with-fhir` additionally marks the
+FHIR sandbox public, since the worker sandboxes have to reach it and hold no
+Daytona token of their own.
+
+Usage:
+
+    export DAYTONA_API_KEY=...
+    uv run --extra daytona python scripts/daytona_run.py \\
+        --task biocoder --sandboxes 4 --n-jobs 2
+
+    # the same ten-per-dataset sample the local smoke runs use
+    uv run --extra daytona python scripts/daytona_run.py \\
+        --task medcalcbench --indices-path data/smoke_indices.json --sandboxes 2
+
+    # MedAgentBench, with the FHIR server in a sandbox of its own
+    uv run --extra daytona python scripts/daytona_run.py \\
+        --task medagentbench --with-fhir --sandboxes 2
+"""
+
+import argparse
+import io
+import json
+import os
+import sys
+import tarfile
+import textwrap
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import toml
+from daytona import (
+    CreateSandboxFromImageParams,
+    CreateSandboxFromSnapshotParams,
+    Daytona,
+    DaytonaConfig,
+    DaytonaError,
+    Image,
+    Resources,
+)
+
+REPO_DIR = Path(__file__).resolve().parent.parent
+REMOTE_REPO = "/home/MedAgentGym"
+# Prebuilt by Dockerfile.daytona, one level above the clone so that `uv sync` in
+# the clone finds a warm environment instead of resolving the `tasks` extra from
+# scratch in every sandbox.
+REMOTE_VENV = "/home/.venv"
+DEFAULT_REPO_URL = "https://github.com/lmnr-ai/MedAgentGym.git"
+FHIR_IMAGE = "jyxsu6/medagentbench:latest"
+FHIR_PORT = 8080
+# Keys worth forwarding. The harness exports every top-level key of
+# credentials.toml as an environment variable, so an allowlist is what keeps an
+# unrelated local key from being shipped to a third party by accident.
+FORWARDED_KEYS = (
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "API_VERSION",
+    "OPENAI_API_KEY",
+    "LMNR_PROJECT_API_KEY",
+    "LMNR_BASE_URL",
+    "MEDAGENTBENCH_FHIR_URL",
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--task",
+        required=True,
+        choices=["biocoder", "biodsbench", "medagentbench", "medcalcbench"],
+    )
+    parser.add_argument(
+        "--config-path", help="defaults to configs/gpt_5_6_luna/exp-gpt_5_6_luna-<task>.yaml"
+    )
+    parser.add_argument("--mode", default="test", help="train/test (default test)")
+    parser.add_argument(
+        "--indices-path", help="JSON of {task: {mode: [idx, ...]}} to run instead of a range"
+    )
+    parser.add_argument("--start-idx", type=int, default=0)
+    parser.add_argument("--end-idx", type=int, default=-1, help="-1 means all of data/metadata.json")
+    parser.add_argument("--sandboxes", type=int, default=4, help="how many sandboxes to shard across")
+    parser.add_argument("--n-jobs", type=int, default=1, help="joblib workers *inside* each sandbox")
+    parser.add_argument("--num-rollouts", type=int, default=1)
+    parser.add_argument("--num-steps", type=int)
+    parser.add_argument("--result-dir-tag", help="overrides the config; also the Laminar session id")
+    parser.add_argument("--repo-url", default=DEFAULT_REPO_URL)
+    parser.add_argument("--ref", default="main", help="branch, tag or commit to clone")
+    parser.add_argument("--credentials", default=str(REPO_DIR / "credentials.toml"))
+    parser.add_argument(
+        "--snapshot",
+        help="use this prebuilt Daytona snapshot instead of building Dockerfile.daytona",
+    )
+    parser.add_argument(
+        "--output-dir", default=str(REPO_DIR), help="local directory the `workdir/` tree lands under"
+    )
+    parser.add_argument("--cpu", type=int, default=2, help="CPU cores per sandbox")
+    parser.add_argument("--memory", type=int, default=4, help="GiB of RAM per sandbox")
+    parser.add_argument("--disk", type=int, default=10, help="GiB of disk per sandbox")
+    parser.add_argument("--timeout", type=int, default=4 * 60 * 60, help="seconds allowed per shard")
+    parser.add_argument(
+        "--with-fhir",
+        action="store_true",
+        help="start a HAPI FHIR sandbox and point the workers at it (MedAgentBench only)",
+    )
+    parser.add_argument(
+        "--keep-sandboxes", action="store_true", help="skip cleanup, to inspect a failure"
+    )
+    return parser.parse_args()
+
+
+def load_credentials(path: str) -> dict[str, str]:
+    """Read the local credentials file down to the keys the sandboxes need."""
+    if not os.path.exists(path):
+        sys.exit(f"{path} not found. Copy credentials.example.toml and fill it in.")
+    local = toml.load(path)
+    creds = {k: str(v) for k, v in local.items() if k in FORWARDED_KEYS and v}
+    if not creds:
+        sys.exit(f"{path} has none of the keys the sandboxes need: {', '.join(FORWARDED_KEYS)}")
+    return creds
+
+
+def resolve_indices(args: argparse.Namespace) -> list[int]:
+    """The full list of task indices to run, before sharding."""
+    if args.indices_path:
+        with open(args.indices_path) as f:
+            return list(json.load(f)[args.task][args.mode])
+    end_idx = args.end_idx
+    if end_idx == -1:
+        with open(REPO_DIR / "data" / "metadata.json") as f:
+            end_idx = json.load(f)[args.task][args.mode]
+    return list(range(args.start_idx, end_idx))
+
+
+def shard(indices: list[int], n: int) -> list[list[int]]:
+    """Deal the indices round-robin.
+
+    Not contiguous slices: these files are grouped by source project and by
+    calculator, so difficulty is correlated with position and contiguous shards
+    would finish at wildly different times. A run costs as much wall clock as
+    its slowest shard.
+    """
+    return [s for s in (indices[i::n] for i in range(n)) if s]
+
+
+def run_remote(sandbox, command: str, timeout: int, label: str) -> str:
+    """Run one command in a sandbox, and fail loudly with its output."""
+    response = sandbox.process.exec(command, cwd=REMOTE_REPO, timeout=timeout)
+    if response.exit_code != 0:
+        raise RuntimeError(
+            f"[{label}] exit code {response.exit_code} from:\n  {command}\n"
+            f"{textwrap.indent(response.result or '', '  ')}"
+        )
+    return response.result or ""
+
+
+def run_detached(sandbox, command: str, timeout: int, label: str) -> int:
+    """Start `command` in the background and poll until it writes its exit code.
+
+    Not a plain `exec` with a long timeout: a shard runs for hours and holding
+    one HTTP response open that long is at the mercy of every proxy in between.
+    Polling also gives somewhere to report progress from, and leaves the run
+    alive in the sandbox if this driver stumbles.
+    """
+    sandbox.process.exec(
+        f"rm -f /tmp/exit_code && nohup bash -c '{command}; echo $? > /tmp/exit_code' "
+        f"> /tmp/run.log 2>&1 & echo started",
+        cwd=REMOTE_REPO,
+        timeout=60,
+    )
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(30)
+        probe = sandbox.process.exec("cat /tmp/exit_code 2>/dev/null", cwd=REMOTE_REPO, timeout=60)
+        code = (probe.result or "").strip()
+        if code:
+            return int(code)
+        written = sandbox.process.exec(
+            "ls workdir/*/*/*/history_*.json 2>/dev/null | wc -l", cwd=REMOTE_REPO, timeout=60
+        )
+        print(f"[{label}] {(written.result or '0').strip()} trajectories written")
+    raise RuntimeError(f"[{label}] shard did not finish within {timeout}s")
+
+
+def start_fhir_sandbox(client: Daytona, args: argparse.Namespace):
+    """Bring up MedAgentBench's FHIR server as its own sandbox.
+
+    This path is *unverified*: it was written in an environment with neither a
+    Daytona key nor Docker, which is the reason it exists at all. The shape is
+    upstream's `data/medagentbench/start_eval_docker.sh` with `docker run`
+    replaced by a sandbox and the published port replaced by a preview URL.
+
+    The sandbox is public because the workers have to reach it and carry no
+    Daytona token; it holds only MedAgentBench's synthetic patients, but it is
+    world-reachable for the life of the run.
+    """
+    print(f"[fhir] creating sandbox from {FHIR_IMAGE} ...")
+    sandbox = client.create(
+        CreateSandboxFromImageParams(
+            image=FHIR_IMAGE,
+            public=True,
+            os_user="root",
+            labels={"medagentgym": "fhir"},
+            resources=Resources(cpu=2, memory=4, disk=10),
+            auto_stop_interval=0,
+            ttl_minutes=args.timeout // 60 + 60,
+        ),
+        timeout=900,
+    )
+    # Daytona replaces the image's entrypoint with its own agent, so whatever
+    # the image would have run on start has to be started by hand.
+    sandbox.process.exec("nohup /entrypoint.sh > /tmp/fhir.log 2>&1 & echo started", timeout=60)
+    url = sandbox.get_preview_link(FHIR_PORT).url.rstrip("/") + "/fhir/"
+    print(f"[fhir] waiting for {url} ...")
+    for _ in range(60):
+        probe = sandbox.process.exec(
+            f"curl -s -o /dev/null -w '%{{http_code}}' {url}metadata", timeout=60
+        )
+        if (probe.result or "").strip() == "200":
+            print(f"[fhir] ready at {url}")
+            return sandbox, url
+        time.sleep(10)
+    raise RuntimeError(
+        f"FHIR server did not answer at {url} within 10 minutes. Re-run with "
+        f"--keep-sandboxes and read /tmp/fhir.log in the sandbox."
+    )
+
+
+def provision(client: Daytona, image, args: argparse.Namespace, creds: dict[str, str], label: str):
+    """Create one sandbox and get the repo, its deps and the credentials into it."""
+    common = {
+        "os_user": "root",
+        "labels": {"medagentgym": args.task, "shard": label},
+        "resources": Resources(cpu=args.cpu, memory=args.memory, disk=args.disk),
+        # A shard is hours of silence from Daytona's point of view, which the
+        # default 15-minute idle timer would happily stop out from under us.
+        # `ttl_minutes` is the backstop instead: wall clock from creation, so it
+        # still fires if this driver dies before reaching its cleanup.
+        "auto_stop_interval": 0,
+        "ttl_minutes": args.timeout // 60 + 60,
+    }
+    if args.snapshot:
+        params = CreateSandboxFromSnapshotParams(snapshot=args.snapshot, **common)
+        sandbox = client.create(params, timeout=900)
+    else:
+        sandbox = client.create(
+            CreateSandboxFromImageParams(image=image, **common),
+            timeout=1800,
+            on_snapshot_create_logs=lambda line: print(f"[image] {line.rstrip()}"),
+        )
+
+    sandbox.git.clone(args.repo_url, REMOTE_REPO, branch=args.ref)
+    # Nearly a no-op when the clone's lockfile matches the one baked into the
+    # image, which is the point of baking it in; it still installs the project
+    # itself, which the image deliberately skipped.
+    run_remote(
+        sandbox,
+        f"UV_PROJECT_ENVIRONMENT={REMOTE_VENV} uv sync --locked --extra tasks",
+        timeout=3600,
+        label=label,
+    )
+    # Uploaded as a file rather than passed as `env_vars` so the secrets stay out
+    # of the sandbox's metadata -- and because `set_environment_variables()`
+    # exports every key of this file anyway, which is how MEDAGENTBENCH_FHIR_URL
+    # reaches the task module.
+    sandbox.fs.upload_file(toml.dumps(creds).encode(), f"{REMOTE_REPO}/credentials.toml")
+    if args.task == "biodsbench":
+        # ~160 MB of cBioPortal studies, gitignored, so the clone lacks them.
+        run_remote(
+            sandbox,
+            f"{REMOTE_VENV}/bin/python scripts/fetch_biodsbench_data.py",
+            timeout=1800,
+            label=label,
+        )
+    return sandbox
+
+
+def run_shard(client: Daytona, image, args: argparse.Namespace, creds: dict[str, str],
+              indices: list[int], label: str) -> dict:
+    """Provision a sandbox, run its shard, and bring the trajectories home."""
+    sandbox = None
+    try:
+        print(f"[{label}] provisioning for {len(indices)} tasks ...")
+        sandbox = provision(client, image, args, creds, label)
+
+        sandbox.fs.upload_file(
+            json.dumps({args.task: {args.mode: indices}}).encode(), f"{REMOTE_REPO}/shard.json"
+        )
+        command = [
+            f"{REMOTE_VENV}/bin/python main.py",
+            f"--config_path {args.config_path}",
+            "--rollout_indices_path shard.json",
+            f"--mode {args.mode}",
+            f"--n_jobs {args.n_jobs}",
+            f"--num_rollouts {args.num_rollouts}",
+        ]
+        if args.num_steps:
+            command.append(f"--num_steps {args.num_steps}")
+        if args.result_dir_tag:
+            command.append(f"--result_dir_tag {args.result_dir_tag}")
+
+        print(f"[{label}] running {len(indices)} tasks ...")
+        exit_code = run_detached(sandbox, " ".join(command), args.timeout, label)
+        if exit_code != 0:
+            tail = run_remote(sandbox, "tail -40 /tmp/run.log", timeout=60, label=label)
+            raise RuntimeError(f"main.py exited {exit_code}:\n{textwrap.indent(tail, '  ')}")
+
+        # One tarball rather than a file at a time: a full run is thousands of
+        # trajectories and each download would be its own round trip.
+        # `running_records.jsonl` is excluded because it is one line per *run*,
+        # so every shard would write its own partial success rate to the same
+        # path and the last one extracted would win. The trajectories, which are
+        # named per task index, do not collide.
+        run_remote(
+            sandbox,
+            "tar czf /tmp/workdir.tgz --exclude=running_records.jsonl workdir",
+            timeout=600,
+            label=label,
+        )
+        blob = sandbox.fs.download_file("/tmp/workdir.tgz")
+        with tarfile.open(fileobj=io.BytesIO(blob)) as tar:
+            tar.extractall(args.output_dir, filter="data")
+        return {"label": label, "tasks": len(indices), "ok": True}
+    except Exception as e:  # noqa: BLE001 - one bad shard must not sink the rest
+        print(f"[{label}] FAILED: {e}")
+        return {"label": label, "tasks": len(indices), "ok": False, "error": str(e)}
+    finally:
+        if sandbox and not args.keep_sandboxes:
+            try:
+                client.delete(sandbox)
+            except DaytonaError as e:
+                print(f"[{label}] could not delete sandbox: {e}")
+
+
+def main() -> None:
+    args = parse_args()
+    if not args.config_path:
+        args.config_path = f"configs/gpt_5_6_luna/exp-gpt_5_6_luna-{args.task}.yaml"
+    if not os.getenv("DAYTONA_API_KEY"):
+        sys.exit("DAYTONA_API_KEY is not set.")
+    if args.with_fhir and args.task != "medagentbench":
+        sys.exit("--with-fhir only makes sense for --task medagentbench.")
+
+    creds = load_credentials(args.credentials)
+    if args.task == "medagentbench" and not args.with_fhir and "MEDAGENTBENCH_FHIR_URL" not in creds:
+        sys.exit(
+            "medagentbench needs a FHIR server: pass --with-fhir, or put a reachable "
+            "MEDAGENTBENCH_FHIR_URL in credentials.toml. Its default, localhost:8080, "
+            "is not reachable from inside a sandbox."
+        )
+
+    indices = resolve_indices(args)
+    shards = shard(indices, args.sandboxes)
+    print(f"{len(indices)} tasks across {len(shards)} sandboxes ({args.n_jobs} joblib workers each)")
+
+    client = Daytona(DaytonaConfig(api_key=os.environ["DAYTONA_API_KEY"]))
+    image = None if args.snapshot else Image.from_dockerfile(REPO_DIR / "Dockerfile.daytona")
+
+    fhir_sandbox = None
+    started = time.time()
+    try:
+        if args.with_fhir:
+            fhir_sandbox, fhir_url = start_fhir_sandbox(client, args)
+            creds["MEDAGENTBENCH_FHIR_URL"] = fhir_url
+
+        with ThreadPoolExecutor(max_workers=len(shards)) as pool:
+            results = list(
+                pool.map(
+                    lambda pair: run_shard(client, image, args, creds, pair[1], f"shard-{pair[0]}"),
+                    enumerate(shards),
+                )
+            )
+    finally:
+        if fhir_sandbox and not args.keep_sandboxes:
+            client.delete(fhir_sandbox)
+
+    ok = [r for r in results if r["ok"]]
+    print("-" * 50)
+    print(
+        f"{len(ok)}/{len(results)} shards finished in {time.time() - started:.0f}s; "
+        f"trajectories under {os.path.join(args.output_dir, 'workdir')}"
+    )
+    for failure in (r for r in results if not r["ok"]):
+        print(f"  {failure['label']} failed: {failure['error']}")
+    # A partially completed run is a failed run as far as a CI caller is concerned.
+    sys.exit(0 if len(ok) == len(results) else 1)
+
+
+if __name__ == "__main__":
+    main()
