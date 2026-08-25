@@ -1,11 +1,11 @@
 {
     "biocoder": {
-        "train": 981,
-        "test": 157
+        "train": 496,
+        "test": 149
     },
     "biodsbench": {
-        "train": 50,
-        "test": 49
+        "train": 42,
+        "test": 43
     },
     "medagentbench": {
         "train": 240,

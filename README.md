@@ -25,16 +25,18 @@ This is the official repository for the paper: "MedAgentGym: Training LLM Agents
 > (MIMIC-III, eICU, TREQS, EHRShot, EHRCon, EHR-SeqSQL, MIMIC-Extract) and to nPowerAI
 > has been removed from the task modules, configs, and `./data/`. Do not re-add them.
 
-| Dataset | `--task` | Data shipped in-repo | External prerequisite |
-| --- | --- | --- | --- |
-| BioCoder | `biocoder` | yes | bioinformatics Python packages for reference execution |
-| BioDSBench | `biodsbench` | task definitions only | cBioPortal study CSVs under `data/biodsbench/data/` |
-| MedAgentBench | `medagentbench` | yes | HAPI FHIR server on `http://localhost:8080/fhir/` |
-| MedCalcBench | `medcalcbench` | yes (test split only) | none |
+| Dataset | `--task` | Train | Test | External prerequisite |
+| --- | --- | --- | --- | --- |
+| BioCoder | `biocoder` | 496 | 149 | the `tasks` extra (reference programs are executed) |
+| BioDSBench | `biodsbench` | 42 | 43 | `scripts/fetch_biodsbench_data.py` (~160 MB of study data) |
+| MedAgentBench | `medagentbench` | 240 | 60 | HAPI FHIR server on `http://localhost:8080/fhir/` |
+| MedCalcBench | `medcalcbench` | — | 1047 | none |
 
 Task files (`train_tasks.jsonl` / `test_tasks.jsonl`) hold the task id, description,
 question, and ground-truth answer for each datapoint. `data/metadata.json` holds the
 per-split datapoint counts and is what `--end_idx -1` resolves against.
+
+Every dataset here is graded by executing code; there is no LLM-as-a-judge anywhere.
 
 Per-dataset notes:
 
@@ -42,12 +44,11 @@ Per-dataset notes:
   brings up `jyxsu6/medagentbench` on port 8080. Tasks 3/5/8/9/10 write to it, so restart
   the server between full runs to get a clean state.
 - **BioCoder** derives its ground truth at task-setup time by *executing the reference
-  program* and capturing stdout. If a reference program cannot import a package, that
-  task's "ground truth" silently becomes an error string and the task is unwinnable —
-  install the `tasks` extra before running.
-- **BioDSBench** ships task definitions only. The referenced study CSVs
-  (`/workdir/data_*.csv`) are not in this repo and must be placed under
-  `data/biodsbench/data/`.
+  program* and capturing stdout, so a task is only gradable if its reference runs. The
+  counts above are what `scripts/filter_biocoder.py` verified against the `tasks` extra;
+  re-run it whenever that extra changes.
+- **BioDSBench** ships task definitions only. Run `scripts/fetch_biodsbench_data.py` once
+  to download the eleven cBioPortal studies the tasks read; the output is gitignored.
 - **MedCalcBench** has no train split in this repo; only `test_tasks.jsonl` (1047 rows).
 
 ### What this fork changes
@@ -60,6 +61,15 @@ Per-dataset notes:
 - `rollout.py` was folded into `main.py` as `--num_rollouts` / `--rollout_indices_path`.
 - Ray, vLLM, `request_info`, and the unused `langchain` / `transformers` / WolframAlpha
   code paths were removed. Parallelism is joblib-only.
+- Upstream spliced the agent's code into a task template with a plain `str.replace`,
+  which dropped the marker's indentation and quietly corrupted every submission made
+  inside a class or function body. Substitution now lives in
+  `ehr_gym/env/task/substitution.py` and re-indents the block.
+- Ungradable datapoints were removed (`scripts/filter_*.py`): BioCoder references that
+  crash, print nothing, or print something different on each run, and BioDSBench tasks
+  whose own reference fails their assertions.
+- MedCalcBench's grader compared everything as a float, so the 60 date and
+  gestational-age answers could never pass. It now parses each answer shape.
 
 ### Setup
 
@@ -70,7 +80,19 @@ same environment because `validate_code` executes that code with the venv interp
 ```bash
 uv sync --extra tasks
 cp credentials.example.toml credentials.toml   # then fill in your Azure AI Foundry keys
+uv run python scripts/fetch_biodsbench_data.py # only needed for --task biodsbench
 ```
+
+### Maintenance scripts
+
+| Script | Purpose |
+| --- | --- |
+| `scripts/fetch_biodsbench_data.py` | download + convert the cBioPortal studies BioDSBench reads |
+| `scripts/filter_biocoder.py` | drop BioCoder rows whose reference program is not gradable |
+| `scripts/filter_biodsbench.py` | drop BioDSBench rows whose reference fails its own assertions |
+
+Both filters rewrite the task files in place and update `data/metadata.json`; pass
+`--dry-run` to see the drop report without touching anything.
 
 ### Run an experiment
 

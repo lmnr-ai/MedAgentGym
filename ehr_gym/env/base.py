@@ -11,6 +11,7 @@ from ehr_gym.env.action.action_set import ACTION_SET
 from ehr_gym.env.chat import Chat
 from ehr_gym.env.spaces import AnyDict, Float, Unicode
 from ehr_gym.env.task.base import AbstractEHRTask
+from ehr_gym.env.task.substitution import insert_solution
 from ehr_gym.llm.chat_api import AzureModelArgs
 
 logger = logging.getLogger(__name__)
@@ -142,10 +143,10 @@ class EHREnv(gym.Env, ABC):
 
         # extract obs and information from the environment
         obs = self._get_obs()
-        if "context_info" in obs["info"]:
-            self.need_context = True
-        else:
-            self.need_context = False
+        # Tasks that score the agent's snippet inside a template expose a
+        # `context` / `context_pattern` pair; their submissions get spliced into
+        # that template before execution.
+        self.need_context = getattr(self.task, "context_pattern", None) is not None
         self.env_history.append(obs)
         info = {}
         info["task_goal"] = task_goal
@@ -189,8 +190,9 @@ class EHREnv(gym.Env, ABC):
                 kwargs["debugger"] = self.debugger
                 kwargs["history"] = self.env_history
             elif action == 'validate_code' and self.need_context:
-                kwargs["code"] = self.task.context.replace(self.task.context_pattern, '\n'+kwargs['code']+'\n')
-                # print(kwargs["code"])
+                kwargs["code"] = insert_solution(
+                    self.task.context, kwargs["code"], self.task.context_pattern
+                )
             results = action_function(**kwargs)
         except Exception as e:
             # print(f"Error: {e}")

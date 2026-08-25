@@ -4,5 +4,8 @@ __pycache__/
 cache/
 workdir/
 
+# cBioPortal study data, ~160 MB; run scripts/fetch_biodsbench_data.py
+data/biodsbench/data/
+
 # real credentials; copy credentials.example.toml and fill it in
 credentials.toml

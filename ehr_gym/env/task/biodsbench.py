@@ -1,13 +1,42 @@
+import ast
 import os
 from .base import AbstractEHRTask
+from .substitution import DEFAULT_PATTERN
 import json
-from ehr_gym.env.action.function import validate_code
 
-instruction = """You are an biomedical expert in writing bioinformatics code and answer questions accordingly. 
+instruction = """You are an biomedical expert in writing bioinformatics code and answer questions accordingly.
 Your objective is to write a python code to solve the given question.
 Please only write the code, do not include any other text.
 All the required data are stored in the directory: {dataset_path}
+Your code is appended to the setup code shown below and then checked with
+assertions, so define the variables the question asks for at module level.
 """
+
+dataframe_information = """The data files available to you are described below:
+{dataframes}
+"""
+
+code_history_information = """Your code will be appended to the following setup code, which has already run:
+<code>
+{code_history}
+</code>
+"""
+
+# The tasks were written against a container that mounted one study at /workdir.
+# We keep every study side by side instead, so the paths in the questions, in the
+# setup code and in the assertions are rewritten to the study's own directory.
+WORKDIR_PREFIX = "/workdir"
+
+
+def _as_list(value) -> list[str]:
+    """Several fields are lists that were serialized with repr() into a string."""
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = ast.literal_eval(value)
+    except (ValueError, SyntaxError):
+        return [value] if value else []
+    return parsed if isinstance(parsed, list) else [str(parsed)]
 
 class BioDSBenchTask(AbstractEHRTask):
     """
@@ -70,14 +99,29 @@ class BioDSBenchTask(AbstractEHRTask):
                 for line in f:
                     self.task_list.append(json.loads(line))
         task_data = self.task_list[self.task_id]
-        self.question = task_data['queries'] + '\n' + task_data['cot_instructions']
+        self.study_id = str(task_data['study_ids'])
+        self.dataset_path = os.path.join(self.data_path, 'data', self.study_id)
+        if not os.path.isdir(self.dataset_path):
+            raise FileNotFoundError(
+                f"No data for study {self.study_id} at {self.dataset_path}. "
+                f"Run scripts/fetch_biodsbench_data.py first."
+            )
 
-        self.context = "<<insert solution here>>" + task_data['test_cases']
-        self.context_pattern = "<<insert solution here>>"
+        localize = lambda text: text.replace(WORKDIR_PREFIX, self.dataset_path)
+        self.question = localize(task_data['queries'] + '\n' + task_data['cot_instructions'])
+        self.dataframes = localize(task_data['dataframes'])
+        self.code_history = localize("\n".join(_as_list(task_data['code_histories'])))
+
+        # The agent's submission is spliced between the setup code and the
+        # assertions, so the assertions -- not merely "the code ran" -- decide the
+        # reward, and the agent only has to write the step the question asks for.
+        self.context = "\n".join(
+            [self.code_history, DEFAULT_PATTERN, localize(task_data['test_cases'])]
+        )
+        self.context_pattern = DEFAULT_PATTERN
         self.code_id = '{}-{}'.format(task_data['study_ids'], task_data['question_ids'])
-        self.dataset_path = os.path.join(self.data_path, 'data')
         goal, info = self.setup_goal()
-        
+
         return goal, info
 
     def setup_goal(self) -> tuple[str, dict]:
@@ -89,9 +133,18 @@ class BioDSBenchTask(AbstractEHRTask):
         data_path: str
             Path to the data directory
         """
-        self.goal = self.question
+        # The assertions reference variables that the setup code defines, so the
+        # agent has to see it; upstream built these strings and then dropped them.
+        self.goal = "\n".join(
+            [
+                self.question,
+                dataframe_information.format(dataframes=self.dataframes),
+                code_history_information.format(code_history=self.code_history),
+            ]
+        )
         info = {
             "code_id": self.code_id,
+            "study_id": self.study_id,
             "dataset_path": self.dataset_path,
         }
         return self.goal, info

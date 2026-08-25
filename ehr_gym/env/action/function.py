@@ -1,6 +1,7 @@
 import logging
 import os
 import subprocess
+import sys
 import time
 import traceback
 import uuid
@@ -20,8 +21,12 @@ CODE_TIMEOUT_SECONDS = 120
 def _run_code_file(code_file: Path, timeout: int) -> tuple[int, str, str, float]:
     start_time = time.time()
     try:
+        # `sys.executable`, not `"python"`: the BioCoder ground truth is produced by
+        # running the reference in *this* interpreter at setup time, so grading is
+        # only meaningful if the agent's code sees the same site-packages. Resolving
+        # `python` through PATH silently picks up whatever venv the shell activated.
         process = subprocess.run(
-            ["python", str(code_file)],
+            [sys.executable, str(code_file)],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -135,7 +140,11 @@ def terminal(cmd: str) -> dict[str, Any]:
         terminal("pip install pysam")
     """
     start_time = time.time()
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    # `pip install ...` is the whole point of this action, so make `pip` and
+    # `python` mean the interpreter that will later run the agent's code.
+    env = os.environ.copy()
+    env["PATH"] = os.pathsep.join([str(Path(sys.executable).parent), env.get("PATH", "")])
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
     execution_time = time.time() - start_time
     if result.returncode == 0:
         return {
