@@ -18,24 +18,22 @@ This is the official repository for the paper: "MedAgentGym: Training LLM Agents
   <img src="./assets/figure1.png" width="100%" alt="teaser">
 </p>
 
-### Dataset Access
+### Datasets
 
-#### EHR Data Access (<font color=#FF000>Update on July 18th, 2025</font>)
-MedAgentGym has been carefully curated in strict accordance with ethical standards, utilizing datasets that are either publicly available or that incorporate rigorous privacy protection and anonymization measures. Table 7 in the Appendix details the specific access requirements for each of the 12 datasets included in MedAgentGym. Researchers seeking access to preprocessed tasks and data files must first obtain and submit all necessary data usage agreements. Access Policy: Only credentialed users who have signed the Data Use Agreement (DUA) are permitted to access these files. 
-```
-License (for files): PhysioNet Credentialed Health Data License 1.5.0
-Data Use Agreement: PhysioNet Credentialed Health Data Use Agreement 1.5.0
-Required Training: CITI Data or Specimens Only Research.
-```
-Please note, this current version excludes the MIMIC-related (MIMIC-III, eICU, TREQS) and EHRSHOT dataset. Access to data involving [MIMIC-III](https://physionet.org/content/mimiciii/1.4/), [eICU](https://eicu-crd.mit.edu), and [EHRSHOT](https://redivis.com/datasets/53gc-8rhx41kgt) tasks requires additional approval from PhysioNet and Stanford University. Researchers seeking for any additional guidance on full access to preprocessed data can send an email to `medagentgym@gmail.com`, using the subject line “MedAgentGym Preprocessed Data Access".
+> **Fork note.** This fork intentionally ships **only the four datasets that require no
+> credentialed data-use agreement**. Everything tied to restricted EHR corpora
+> (MIMIC-III, eICU, TREQS, EHRShot, EHRCon, EHR-SeqSQL, MIMIC-Extract) and to nPowerAI
+> has been removed from the task modules, configs, and `./data/`. Do not re-add them.
 
-#### Tasks Definition and Access
-This repository contains basic task files `train_tasks.jsonl` and `test_tasks.jsonl`, each including the task ID, task description, question, and corresponding ground truth answer.
-After completing the previous step and obtaining approval for access, applicants will receive a script (`download_data.py`) to download the entire preprocessed dataset from a private repository. This script will automatically download all datasets into the `./data/` directory. The downloaded datasets should be structured as `./data/biocoder/*`. Detailed descriptions of the datasets utilized in this paper are provided below:
+| Dataset | `--task` | Data shipped in-repo | External prerequisite |
+| --- | --- | --- | --- |
+| BioCoder | `biocoder` | yes | bioinformatics Python packages for reference execution |
+| BioDSBench | `biodsbench` | task definitions only | cBioPortal study CSVs under `data/biodsbench/data/` |
+| MedAgentBench | `medagentbench` | yes | HAPI FHIR server on `http://localhost:8080/fhir/` |
+| MedCalcBench | `medcalcbench` | yes (test split only) | none |
 
-<p align="center">
-  <img src="./assets/figure3.png" width="100%" alt="teaser">
-</p>
+Task files (`train_tasks.jsonl` / `test_tasks.jsonl`) hold the task id, description,
+question, and ground-truth answer for each datapoint.
 
 
 ### Build Docker Container

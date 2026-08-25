@@ -64,36 +64,18 @@ def create_env_config_dir(work_dir, task, result_dir_tag):
     return env_config_tmp_dir
 
 def get_task_class(task):
-    if task == 'mimic_iii':
-        from ehr_gym.env.task.mimic_iii import MimiciiiEHRTask
-        return MimiciiiEHRTask
-    elif task == 'biocoder':
+    if task == 'biocoder':
         from ehr_gym.env.task.biocoder import BiocoderTask
         return BiocoderTask
-    elif task == 'eicu':
-        from ehr_gym.env.task.eicu import EicuEHRTask
-        return EicuEHRTask
-    elif task == 'treqs':
-        from ehr_gym.env.task.treqs import TreqsEHRTask
-        return TreqsEHRTask
-    elif task == 'medcalcbench':
-        from ehr_gym.env.task.medcalcbench import MedCalBenchTask
-        return MedCalBenchTask
+    elif task == 'biodsbench':
+        from ehr_gym.env.task.biodsbench import BioDSBenchTask
+        return BioDSBenchTask
     elif task == 'medagentbench':
         from ehr_gym.env.task.medagentbench import MedAgentBenchTask
         return MedAgentBenchTask
-    elif task == 'ehrshot':
-        from ehr_gym.env.task.ehrshot import EHRShotTask
-        return EHRShotTask
-    elif task == 'ehr_seqsql':
-        from ehr_gym.env.task.ehr_seqsql import EHRSeqSQLEHRTask
-        return EHRSeqSQLEHRTask
-    elif task == 'ehrcon':
-        from ehr_gym.env.task.ehrcon import EHRCONEHRTask
-        return EHRCONEHRTask
-    elif task == "biodsbench":
-        from ehr_gym.env.task.biodsbench import BioDSBenchTask
-        return BioDSBenchTask
+    elif task == 'medcalcbench':
+        from ehr_gym.env.task.medcalcbench import MedCalBenchTask
+        return MedCalBenchTask
     else:
         raise ValueError(f'Invalid task: {task}')
 
@@ -150,10 +132,7 @@ def run_single_experiment(args, config, idx):
 
         if done:
             agent.conversation_history.append({'result': 'success', 'score': reward})
-            if args.task == 'ehrshot':
-                success = reward
-            else:
-                success = 1
+            success = 1
         else:
             agent.conversation_history.append({'result': 'failure'})
             success = 0
