@@ -41,6 +41,8 @@ import argparse
 import io
 import json
 import os
+import re
+import shlex
 import sys
 import tarfile
 import textwrap
@@ -68,6 +70,11 @@ REMOTE_VENV = "/home/.venv"
 DEFAULT_REPO_URL = "https://github.com/lmnr-ai/MedAgentGym.git"
 FHIR_IMAGE = "jyxsu6/medagentbench:latest"
 FHIR_PORT = 8080
+# What `--ref` has to look like to be treated as a commit rather than a branch.
+# `git.clone` takes the two on different keyword arguments and the server clones
+# with `--branch`, which does not accept a SHA -- so a pinned commit passed as a
+# branch fails provisioning in every sandbox rather than checking anything out.
+COMMIT_RE = re.compile(r"[0-9a-f]{7,40}")
 # Keys worth forwarding. The harness exports every top-level key of
 # credentials.toml as an environment variable, so an allowlist is what keeps an
 # unrelated local key from being shipped to a third party by accident.
@@ -107,7 +114,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-steps", type=int)
     parser.add_argument("--result-dir-tag", help="overrides the config; also the Laminar session id")
     parser.add_argument("--repo-url", default=DEFAULT_REPO_URL)
-    parser.add_argument("--ref", default="main", help="branch, tag or commit to clone")
+    parser.add_argument(
+        "--ref",
+        default="main",
+        help="branch or tag to clone; anything that looks like a commit SHA is "
+        "checked out detached instead",
+    )
     parser.add_argument("--credentials", default=str(REPO_DIR / "credentials.toml"))
     parser.add_argument(
         "--snapshot",
@@ -176,16 +188,23 @@ def run_remote(sandbox, command: str, timeout: int, label: str) -> str:
     return response.result or ""
 
 
-def run_detached(sandbox, command: str, timeout: int, label: str) -> int:
-    """Start `command` in the background and poll until it writes its exit code.
+def run_detached(sandbox, argv: list[str], timeout: int, label: str) -> int:
+    """Start `argv` in the background and poll until it writes its exit code.
 
     Not a plain `exec` with a long timeout: a shard runs for hours and holding
     one HTTP response open that long is at the mercy of every proxy in between.
     Polling also gives somewhere to report progress from, and leaves the run
     alive in the sandbox if this driver stumbles.
+
+    Takes an argv rather than a string because the command is interpolated into
+    a `bash -c` that is itself interpolated into an outer shell, so a config path
+    or a `--result-dir-tag` holding a space or a quote would otherwise be split
+    or terminate the quoting -- and the failure is silent, since the job that
+    never starts also never writes the exit code this polls for.
     """
+    inner = f"{shlex.join(argv)}; echo $? > /tmp/exit_code"
     sandbox.process.exec(
-        f"rm -f /tmp/exit_code && nohup bash -c '{command}; echo $? > /tmp/exit_code' "
+        f"rm -f /tmp/exit_code && nohup bash -c {shlex.quote(inner)} "
         f"> /tmp/run.log 2>&1 & echo started",
         cwd=REMOTE_REPO,
         timeout=60,
@@ -271,7 +290,14 @@ def provision(client: Daytona, image, args: argparse.Namespace, creds: dict[str,
             on_snapshot_create_logs=lambda line: print(f"[image] {line.rstrip()}"),
         )
 
-    sandbox.git.clone(args.repo_url, REMOTE_REPO, branch=args.ref)
+    # Tags go on `branch=` -- `git clone --branch` takes either -- but a SHA has
+    # to go on `commit_id=`, which leaves the clone in detached HEAD. Hex is the
+    # only thing distinguishing them, so a branch named like a SHA would be
+    # misread; `refs/heads/<name>` forces the branch reading if that ever bites.
+    if COMMIT_RE.fullmatch(args.ref):
+        sandbox.git.clone(args.repo_url, REMOTE_REPO, commit_id=args.ref)
+    else:
+        sandbox.git.clone(args.repo_url, REMOTE_REPO, branch=args.ref)
     # Nearly a no-op when the clone's lockfile matches the one baked into the
     # image, which is the point of baking it in; it still installs the project
     # itself, which the image deliberately skipped.
@@ -308,21 +334,24 @@ def run_shard(client: Daytona, image, args: argparse.Namespace, creds: dict[str,
         sandbox.fs.upload_file(
             json.dumps({args.task: {args.mode: indices}}).encode(), f"{REMOTE_REPO}/shard.json"
         )
-        command = [
-            f"{REMOTE_VENV}/bin/python main.py",
-            f"--config_path {args.config_path}",
-            "--rollout_indices_path shard.json",
-            f"--mode {args.mode}",
-            f"--n_jobs {args.n_jobs}",
-            f"--num_rollouts {args.num_rollouts}",
+        # One list element per argv word, so `run_detached` can quote each of
+        # them individually on the way through two nested shells.
+        argv = [
+            f"{REMOTE_VENV}/bin/python",
+            "main.py",
+            "--config_path", args.config_path,
+            "--rollout_indices_path", "shard.json",
+            "--mode", args.mode,
+            "--n_jobs", str(args.n_jobs),
+            "--num_rollouts", str(args.num_rollouts),
         ]
         if args.num_steps:
-            command.append(f"--num_steps {args.num_steps}")
+            argv += ["--num_steps", str(args.num_steps)]
         if args.result_dir_tag:
-            command.append(f"--result_dir_tag {args.result_dir_tag}")
+            argv += ["--result_dir_tag", args.result_dir_tag]
 
         print(f"[{label}] running {len(indices)} tasks ...")
-        exit_code = run_detached(sandbox, " ".join(command), args.timeout, label)
+        exit_code = run_detached(sandbox, argv, args.timeout, label)
         if exit_code != 0:
             tail = run_remote(sandbox, "tail -40 /tmp/run.log", timeout=60, label=label)
             raise RuntimeError(f"main.py exited {exit_code}:\n{textwrap.indent(tail, '  ')}")
