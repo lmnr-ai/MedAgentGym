@@ -33,23 +33,72 @@ This is the official repository for the paper: "MedAgentGym: Training LLM Agents
 | MedCalcBench | `medcalcbench` | yes (test split only) | none |
 
 Task files (`train_tasks.jsonl` / `test_tasks.jsonl`) hold the task id, description,
-question, and ground-truth answer for each datapoint.
+question, and ground-truth answer for each datapoint. `data/metadata.json` holds the
+per-split datapoint counts and is what `--end_idx -1` resolves against.
 
+Per-dataset notes:
 
-### Build Docker Container
-Since our dataset relies on a Docker environment for isolated coding and execution, you may first build the Docker container. Please execute the following command:
+- **MedAgentBench** grades against a live FHIR server: `bash data/medagentbench/start_eval_docker.sh`
+  brings up `jyxsu6/medagentbench` on port 8080. Tasks 3/5/8/9/10 write to it, so restart
+  the server between full runs to get a clean state.
+- **BioCoder** derives its ground truth at task-setup time by *executing the reference
+  program* and capturing stdout. If a reference program cannot import a package, that
+  task's "ground truth" silently becomes an error string and the task is unwinnable —
+  install the `tasks` extra before running.
+- **BioDSBench** ships task definitions only. The referenced study CSVs
+  (`/workdir/data_*.csv`) are not in this repo and must be placed under
+  `data/biodsbench/data/`.
+- **MedCalcBench** has no train split in this repo; only `test_tasks.jsonl` (1047 rows).
+
+### What this fork changes
+
+- Only the four unrestricted datasets remain; all restricted task modules, configs and
+  data directories are gone.
+- Packaging moved from `requirements.txt` to `uv` (`pyproject.toml` + `uv.lock`).
+- The Docker image is plain `python:3.11-slim` instead of `nvidia/cuda:*-devel`, and
+  `torch` is gone — nothing here runs a local model.
+- `rollout.py` was folded into `main.py` as `--num_rollouts` / `--rollout_indices_path`.
+- Ray, vLLM, `request_info`, and the unused `langchain` / `transformers` / WolframAlpha
+  code paths were removed. Parallelism is joblib-only.
+
+### Setup
+
+Dependencies are managed with [uv](https://docs.astral.sh/uv/). The `tasks` extra holds
+the scientific packages that the *agent-generated* code needs; it is installed into the
+same environment because `validate_code` executes that code with the venv interpreter.
+
 ```bash
-docker buildx build -t ehr_gym:latest .
+uv sync --extra tasks
+cp credentials.example.toml credentials.toml   # then fill in your Azure AI Foundry keys
 ```
-Alternatively, you can run the prepared script directly:
+
+### Run an experiment
+
+```bash
+uv run python main.py --config_path configs/gpt_4_1_mini/exp-gpt_4_1_mini-biocoder.yaml --n_jobs 5
+```
+
+Useful flags:
+
+| Flag | Meaning |
+| --- | --- |
+| `--n_jobs N` | joblib process-level parallelism (default 1) |
+| `--num_rollouts K` | sample K trajectories per task; writes `history_<idx>_<rollout>.json` |
+| `--mode train\|test` | which split to run (default `test`) |
+| `--start_idx` / `--end_idx` | index range; `--end_idx -1` means "all", read from `data/metadata.json` |
+| `--rollout_indices_path` | JSON of `{task: {mode: [idx, ...]}}`, e.g. `data/rollout_indices.json` |
+
+Trajectories land in `<work_dir>/<task>/<result_dir_tag>/<mode>/history_*.json`. Existing
+files are skipped, so a run can be resumed by re-invoking the same command.
+
+### Running in Docker
+
+The image is CPU-only — this harness only calls hosted LLM APIs, so there is no CUDA
+runtime and no `torch`.
+
 ```bash
 bash build_docker.sh
-```
-
-### Run Experiment
-Prepare your experiment commands in the `entrypoint.sh` file. For instance, to run experiments on the Biocoder task using the GPT-4.1-mini model, execute the following command for parallel execution with 5 threads:
-```bash
-python3 /home/main.py --config /home/configs/gpt_4_1_mini/exp-gpt_4_1_mini-biocoder.yaml --async_run --parallel_backend joblib --n_jobs 5
+TASK_NAME=biocoder N_JOBS=5 bash run_docker.sh
 ```
 
 ## Results

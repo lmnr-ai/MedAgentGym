@@ -1,42 +1,20 @@
-import os
-import re
 import json
-import time
-import subprocess
-from dataclasses import dataclass, field
-from abc import ABC
-import pandas as pd
-import numpy as np
-import datetime as datetime
-import gymnasium as gym
-from gymnasium import spaces
 import logging
-from ehr_gym.env.task.base import AbstractEHRTask
-from ehr_gym.env.spaces import AnyDict, Float, Unicode
+import re
+import time
+from abc import ABC
+from typing import Callable, Optional
+
+import gymnasium as gym
+
+from ehr_gym.env.action.action_set import ACTION_SET
 from ehr_gym.env.chat import Chat
-from ehr_gym.env.action.action_set import BasicActionSet
+from ehr_gym.env.spaces import AnyDict, Float, Unicode
+from ehr_gym.env.task.base import AbstractEHRTask
 from ehr_gym.llm.chat_api import AzureModelArgs
-from typing import Any, Optional, Callable
 
-
-logging.basicConfig(
-    level=logging.INFO, format="%(name)s : %(levelname)-8s : %(message)s"
-)
 logger = logging.getLogger(__name__)
 
-# Base record classes for different types of environment interactions
-@dataclass
-class BaseRecord:
-    timestamp: datetime
-    code: str = None
-    output: str = None
-    success: bool = None
-    execution_time: float = None
-
-@dataclass
-class InfoRequestRecord(BaseRecord):
-    info_type: str = field(default="")
-    content: Any = None
 
 class EHREnv(gym.Env, ABC):
     """The main EHRGym class, which encapsulates instruction-following EHR question-answering into a Gymnasium environment."""
@@ -53,7 +31,7 @@ class EHREnv(gym.Env, ABC):
                 "debugger_config": None,
             },
             # agent-related arguments
-            action_mapping: Optional[Callable] = BasicActionSet().action_set,
+            action_mapping: Optional[Callable] = ACTION_SET,
         ):
         """
         Instantiate a ready to use EHREnv gym environment.
@@ -92,8 +70,6 @@ class EHREnv(gym.Env, ABC):
         # initialize chat
         self.chat: Chat = None
 
-        self.terminate_on_infeasible = False
-
         debugger_config = self.task_kwargs.get("debugger_config", None)
         self.debugger = AzureModelArgs(
             model_name=debugger_config["model_name"],
@@ -109,11 +85,8 @@ class EHREnv(gym.Env, ABC):
         if self.task:
             self.task.teardown()
             self.task = None
-        if self.chat:
-            self.chat.close()
-            self.chat = None
-        if self.env_history != []:
-            self.env_history = []
+        self.chat = None
+        self.env_history = []
     
     def reset(self, task_id, *args, **kwargs):
         """
@@ -124,32 +97,16 @@ class EHREnv(gym.Env, ABC):
         if self.task:
             self.task.teardown()
             self.task = None
-        if self.chat:
-            self.chat.close()
-            self.chat = None
+        self.chat = None
         self.env_history = []
         
         # create a new task
         self.task = self.task_entrypoint(task_id=task_id, **self.task_kwargs)
 
-        def override_property(task, env, property):
-            """Extract property value from env if not None, otherwise from task."""
-            env_value = getattr(env, property)
-            task_value = getattr(task, property)
-            if env_value is None:
-                return task_value
-            else:
-                if task_value is not None:
-                    logger.warning(
-                        f"Overriding the task's {property} parameter ({repr(task_value)} => {repr(env_value)}). This might change the task's behaviour and difficulty."
-                    )
-                return env_value
-        
-        # fetch task's desired parameters for setup
         self.chat = Chat()
         self.chat.add_message(
             role="assistant",
-            content="Hi! I am your EHR assistant, I can perform tasks based on the EHR data. What can I help you with?"
+            content="Hi! I am your assistant, I can solve coding-based biomedical tasks. What can I help you with?"
         )
 
         # setup the task goal
@@ -223,17 +180,6 @@ class EHREnv(gym.Env, ABC):
         info["action_exec_start"] = time.time()
         info["action_exec_timeout"] = 0
 
-        def send_message_to_user(text: str):
-            if not isinstance(text, str):
-                raise ValueError(f"Forbidden value: {text} is not a string")
-            self.chat.add_message(role="assistant", content=text)
-        
-        def report_infeasible_instructions(reason: str):
-            if not isinstance(reason, str):
-                raise ValueError(f"Forbidden value: {reason} is not a string")
-            self.chat.add_message(role="infeasible", content=reason)
-            self.infeasible_message_received = True
-        
         # try to execute the action
         logger.debug(f"Executing action")
         try:
@@ -271,11 +217,7 @@ class EHREnv(gym.Env, ABC):
         logger.debug(f"Task validated")
 
         # new step API wants a 5-tuple (gymnasium style)
-        terminated = done or (
-            self.terminate_on_infeasible and self.infeasible_message_received
-        ) # task or agent can terminate the episode
-        truncated = False
-        return obs, reward, terminated, truncated, info
+        return obs, reward, done, False, info
     
     def _task_validate(self, obs):
         reward, done, user_message, task_info = self.task.validate(self.chat.messages, obs)

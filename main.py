@@ -1,201 +1,179 @@
 import argparse
-import os
+import json
 import logging
-from pathlib import Path
-import sys
+import os
 import time
-import toml
-from ehr_gym.env.base import EHREnv
-from ehr_gym.agent.base import EHRAgent
-from ehr_gym.utils.general import load_config, save_conversation_history
-import ray
 
-logging.basicConfig(
-    level=logging.INFO, format="%(name)s : %(levelname)-8s : %(message)s"
-)
+import toml
+from joblib import Parallel, delayed
+
+from ehr_gym.agent.base import EHRAgent
+from ehr_gym.env.base import EHREnv
+from ehr_gym.utils.general import load_config, save_conversation_history
+
+logging.basicConfig(level=logging.INFO, format="%(name)s : %(levelname)-8s : %(message)s")
 logger = logging.getLogger(__name__)
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(description='Run EHR-Gym Experiments')
-    parser.add_argument('--config_path', type=str)
+TASK_CLASSES = {
+    "biocoder": ("ehr_gym.env.task.biocoder", "BiocoderTask"),
+    "biodsbench": ("ehr_gym.env.task.biodsbench", "BioDSBenchTask"),
+    "medagentbench": ("ehr_gym.env.task.medagentbench", "MedAgentBenchTask"),
+    "medcalcbench": ("ehr_gym.env.task.medcalcbench", "MedCalBenchTask"),
+}
 
-    parser.add_argument('--task', type=str)
-    parser.add_argument('--credentials_path', type=str)
-    parser.add_argument('--work_dir', type=str)
-    parser.add_argument('--result_dir_tag', type=str)
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Run MedAgentGym experiments")
+    parser.add_argument("--config_path", type=str)
+    parser.add_argument("--task", type=str, choices=sorted(TASK_CLASSES))
+    parser.add_argument("--credentials_path", type=str)
+    parser.add_argument("--work_dir", type=str)
+    parser.add_argument("--result_dir_tag", type=str)
     parser.add_argument("--start_idx", type=int)
     parser.add_argument("--end_idx", type=int)
     parser.add_argument("--num_steps", type=int)
-    parser.add_argument("--async_run", action="store_true", help="Run experiments asynchronously")
-    parser.add_argument("--n_jobs", type=int, help="Number of parallel jobs")
-    parser.add_argument("--parallel_backend", type=str, help="Parallel backend to use")
+    parser.add_argument("--n_jobs", type=int, default=1, help="Number of parallel jobs")
     parser.add_argument("--mode", type=str, default="test", help="train/test")
+    parser.add_argument(
+        "--num_rollouts",
+        type=int,
+        default=1,
+        help="Trajectories to sample per task. >1 writes history_<idx>_<rollout>.json",
+    )
+    parser.add_argument(
+        "--rollout_indices_path",
+        type=str,
+        help="JSON file of {task: {mode: [idx, ...]}}; overrides --start_idx/--end_idx",
+    )
     return parser.parse_args()
 
+
 def convert_config_to_args(config, args):
-    if not args.task:
-        args.task = config['task']
-    if not args.credentials_path:
-        args.credentials_path = config['credentials_path']
-    if not args.work_dir:
-        args.work_dir = config['work_dir']
-    if not args.result_dir_tag:
-        args.result_dir_tag = config['result_dir_tag']
-    if not args.start_idx:
-        args.start_idx = config['start_idx']
-    if not args.end_idx:
-        args.end_idx = config['end_idx']
-    if not args.num_steps:
-        args.num_steps = config['num_steps']
+    for key in (
+        "task",
+        "credentials_path",
+        "work_dir",
+        "result_dir_tag",
+        "start_idx",
+        "end_idx",
+        "num_steps",
+    ):
+        if getattr(args, key) is None:
+            setattr(args, key, config[key])
     return args
 
-def load_credentials(credentials_path):
-    return toml.load(credentials_path)
 
-def set_environment_variables(credentials):
-    for key, value in credentials.items():
+def set_environment_variables(credentials_path):
+    for key, value in toml.load(credentials_path).items():
         os.environ[key] = value
 
-def create_env_config_dir(work_dir, task, result_dir_tag):
-    env_config_tmp_dir = os.path.join(work_dir, task, result_dir_tag)
-    os.makedirs(env_config_tmp_dir, exist_ok=True)
-    return env_config_tmp_dir
 
 def get_task_class(task):
-    if task == 'biocoder':
-        from ehr_gym.env.task.biocoder import BiocoderTask
-        return BiocoderTask
-    elif task == 'biodsbench':
-        from ehr_gym.env.task.biodsbench import BioDSBenchTask
-        return BioDSBenchTask
-    elif task == 'medagentbench':
-        from ehr_gym.env.task.medagentbench import MedAgentBenchTask
-        return MedAgentBenchTask
-    elif task == 'medcalcbench':
-        from ehr_gym.env.task.medcalcbench import MedCalBenchTask
-        return MedCalBenchTask
-    else:
-        raise ValueError(f'Invalid task: {task}')
+    if task not in TASK_CLASSES:
+        raise ValueError(f"Invalid task: {task}")
+    module_name, class_name = TASK_CLASSES[task]
+    module = __import__(module_name, fromlist=[class_name])
+    return getattr(module, class_name)
 
-def sequential_run_experiments(args, config):
-    success_rate = 0
-    for idx in range(args.start_idx, args.end_idx):
-        success = run_single_experiment(args, config, idx)
-        success_rate += success
-    success_rate /= (args.end_idx - args.start_idx)
-    print('-'*50)
-    print(f'Success Rate: {success_rate}')
 
-def run_single_experiment(args, config, idx):
-    agent_config = config['Agent']
-    data_config = config['Data']
-    debugger_config = config['Debugger']
-    save_dir = os.path.join(args.work_dir, args.task, args.result_dir_tag, args.mode)
-    output_path = os.path.join(save_dir, f'history_{idx}.json')
-    if os.path.exists(output_path):
-        logger.info(f"Experiment {idx} already exists. Skipping...")
-        return 0
-    print(f"Running experiment for index {idx}...")
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-    
+def history_path(save_dir, idx, rollout_idx, num_rollouts):
+    name = f"history_{idx}.json" if num_rollouts == 1 else f"history_{idx}_{rollout_idx}.json"
+    return os.path.join(save_dir, name)
+
+
+def run_single_rollout(args, config, idx, rollout_idx, output_path):
+    """Run one trajectory for task `idx` and persist it. Returns 1 on success."""
+    agent_config = config["Agent"]
     task_cls = get_task_class(args.task)
-    task_kwargs = {
-        'data_path': data_config['data_path'],
-        'debugger_config': debugger_config,
-        'mode': args.mode,
-    }
-    env = EHREnv(task_entrypoint=task_cls, task_kwargs=task_kwargs)
+    env = EHREnv(
+        task_entrypoint=task_cls,
+        task_kwargs={
+            "data_path": config["Data"]["data_path"],
+            "debugger_config": config["Debugger"],
+            "mode": args.mode,
+        },
+    )
     agent = EHRAgent(agent_config, permitted_actions=task_cls.permitted_actions)
-    obs, info = env.reset(idx)
+    obs, _ = env.reset(idx)
+
     attempts = 0
-    for step_idx in range(args.num_steps):
+    done = False
+    for _ in range(args.num_steps):
         action, params = agent.act(obs)
-        while action == 'error':
-            n_retry = config['Agent']['n_retry']
-            logger.error(f"Task {args.task}-{idx} Failure: Agent action failed for {n_retry} times.")
+        while action == "error":
+            logger.error(
+                f"Task {args.task}-{idx} failure: agent action failed "
+                f"for {agent_config['n_retry']} times."
+            )
             attempts += 1
-            if attempts >= config['Env']['n_retry']:
-                agent.conversation_history.append({'result': 'failure'})
-                success = 0
-                output_path = os.path.join(save_dir, f'history_{idx}.json')
+            if attempts >= config["Env"]["n_retry"]:
+                agent.conversation_history.append({"result": "failure"})
                 save_conversation_history(agent.conversation_history, output_path)
-                return success
+                return 0
             time.sleep(1)
             action, params = agent.act(obs)
-        obs, reward, done, truncated, info = env.step(action, **params)
+        obs, reward, done, _, _ = env.step(action, **params)
         if done:
             break
 
     if done:
-        agent.conversation_history.append({'result': 'success', 'score': reward})
-        success = 1
+        agent.conversation_history.append({"result": "success", "score": reward})
     else:
-        agent.conversation_history.append({'result': 'failure'})
-        success = 0
-    output_path = os.path.join(save_dir, f'history_{idx}.json')
+        agent.conversation_history.append({"result": "failure"})
     save_conversation_history(agent.conversation_history, output_path)
-    return success
+    return 1 if done else 0
 
-run_single_experiment_ray = ray.remote(run_single_experiment)
 
-def async_run_experiments(args, config, n_jobs, parallel_backend="ray"):
-    if args.start_idx > args.end_idx:
-        logging.warning("No experiments to run")
+def run_single_experiment(args, config, idx):
+    """Run every requested rollout for task `idx`, skipping ones already on disk."""
+    save_dir = os.path.join(args.work_dir, args.task, args.result_dir_tag, args.mode)
+    os.makedirs(save_dir, exist_ok=True)
+    successes = 0
+    for rollout_idx in range(args.num_rollouts):
+        output_path = history_path(save_dir, idx, rollout_idx, args.num_rollouts)
+        if os.path.exists(output_path):
+            logger.info(f"Trajectory {output_path} already exists. Skipping...")
+            continue
+        logger.info(f"Running experiment for index {idx} (rollout {rollout_idx})...")
+        successes += run_single_rollout(args, config, idx, rollout_idx, output_path)
+    return successes
+
+
+def run_experiments(args, config, indices):
+    if not indices:
+        logger.warning("No experiments to run")
         return
-    success_rate = 0
-    try:
-        if parallel_backend == 'joblib':
-            from joblib import Parallel, delayed
-            indices = range(args.start_idx, args.end_idx)
-            # split sequential (should be no longer needed with dependencies)
-            results = Parallel(n_jobs=n_jobs, prefer="processes")(
-                delayed(run_single_experiment)(args, config, idx)
-                for idx in indices
-            )
-            success_rate = sum(results) / len(results)
-            print(f'Success Rate: {success_rate}')
-        elif parallel_backend == "ray":
-            ray.init(num_cpus=n_jobs)
-            indices = range(args.start_idx, args.end_idx)
-            futures = [
-                run_single_experiment_ray.remote(args, config, idx)
-                for idx in indices
-            ]
-            results = ray.get(futures)
-            success_rate = sum(results) / len(results)
-            print(f'Success Rate: {success_rate}')
-            ray.shutdown()
-        else:
-            raise ValueError(f"Unsupported parallel backend: {parallel_backend}")
-    finally:
-        logging.info("All jobs are finished. Calling agent_args.close() on all agents...")
-        logger.info('Experiment finished.')
-        log_file = os.path.join(args.work_dir, "running_records.jsonl")
-        with open(log_file, "a+") as f:
-            f.write(f"Experiment {args.task}: {success_rate}\n")
+    results = Parallel(n_jobs=args.n_jobs, prefer="processes")(
+        delayed(run_single_experiment)(args, config, idx) for idx in indices
+    )
+    success_rate = sum(results) / (len(results) * args.num_rollouts)
+    print("-" * 50)
+    print(f"Success Rate: {success_rate}")
+
+    os.makedirs(args.work_dir, exist_ok=True)
+    with open(os.path.join(args.work_dir, "running_records.jsonl"), "a+") as f:
+        f.write(f"Experiment {args.task}: {success_rate}\n")
+
+
+def resolve_indices(args, config):
+    if args.rollout_indices_path:
+        with open(args.rollout_indices_path, "r") as f:
+            return json.load(f)[args.task][args.mode]
+    end_idx = args.end_idx
+    if end_idx == -1:
+        with open(config["Data"]["metadata_path"], "r") as f:
+            end_idx = json.load(f)[args.task][args.mode]
+    return list(range(args.start_idx, end_idx))
+
 
 def main():
-    # initialization
     args = parse_arguments()
-    if args.config_path:
-        config = load_config(args.config_path)
+    config = load_config(args.config_path) if args.config_path else {}
+    if config:
         args = convert_config_to_args(config, args)
-    if args.end_idx == -1:
-        import json
-        metadata_file = config['Data']['metadata_path']
-        with open(metadata_file, 'r') as f:
-            metadata = json.load(f)
-        args.end_idx = metadata[args.task][args.mode]
-    credentials = load_credentials(args.credentials_path)
-    set_environment_variables(credentials)
-    env_config_tmp_dir = create_env_config_dir(args.work_dir, args.task, args.result_dir_tag)
+    set_environment_variables(args.credentials_path)
+    run_experiments(args, config, resolve_indices(args, config))
 
-    # run experiments
-    if not args.async_run:
-        sequential_run_experiments(args, config)
-    else:
-        async_run_experiments(args, config, args.n_jobs, args.parallel_backend)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

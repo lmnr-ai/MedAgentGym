@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+cache/
+workdir/
+
+# real credentials; copy credentials.example.toml and fill it in
+credentials.toml

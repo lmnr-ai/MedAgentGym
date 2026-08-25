@@ -1,18 +1,18 @@
 {
-    "medcalcbench": {
-        "train": 1005,
-        "test": 1046
-    },
-    "medagentbench": {
-        "train": 239,
-        "test": 59
-    },
     "biocoder": {
         "train": 981,
-        "test": 156
+        "test": 157
     },
     "biodsbench": {
         "train": 50,
         "test": 49
+    },
+    "medagentbench": {
+        "train": 240,
+        "test": 60
+    },
+    "medcalcbench": {
+        "train": 0,
+        "test": 1047
     }
 }
