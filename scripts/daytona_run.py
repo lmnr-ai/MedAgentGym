@@ -38,6 +38,7 @@ Usage:
 """
 
 import argparse
+import inspect
 import io
 import json
 import os
@@ -75,6 +76,15 @@ FHIR_PORT = 8080
 # with `--branch`, which does not accept a SHA -- so a pinned commit passed as a
 # branch fails provisioning in every sandbox rather than checking anything out.
 COMMIT_RE = re.compile(r"[0-9a-f]{7,40}")
+# `extractall(filter=...)` arrived in 3.11.4, so `requires-python = ">=3.11"` is
+# not enough to assume it -- 3.11.2 raises TypeError. Feature-detect rather than
+# version-compare, and ask for it where it exists: it is the default from 3.14,
+# and until then an unfiltered extract trusts absolute paths inside the archive.
+TAR_EXTRACT_KWARGS = (
+    {"filter": "data"}
+    if "filter" in inspect.signature(tarfile.TarFile.extractall).parameters
+    else {}
+)
 # Keys worth forwarding. The harness exports every top-level key of
 # credentials.toml as an environment variable, so an allowlist is what keeps an
 # unrelated local key from being shipped to a third party by accident.
@@ -370,7 +380,7 @@ def run_shard(client: Daytona, image, args: argparse.Namespace, creds: dict[str,
         )
         blob = sandbox.fs.download_file("/tmp/workdir.tgz")
         with tarfile.open(fileobj=io.BytesIO(blob)) as tar:
-            tar.extractall(args.output_dir, filter="data")
+            tar.extractall(args.output_dir, **TAR_EXTRACT_KWARGS)
         return {"label": label, "tasks": len(indices), "ok": True}
     except Exception as e:  # noqa: BLE001 - one bad shard must not sink the rest
         print(f"[{label}] FAILED: {e}")
