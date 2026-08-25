@@ -222,7 +222,7 @@ Question: {self.question}
         """
         
         if obs["type"] == "code_execution":
-            pred = obs["env_message"]
+            pred = obs.get("stdout", obs["env_message"])
             try:
                 correctness = self.compare(pred)
             except ValueError as e:

@@ -6,13 +6,14 @@ from abc import ABC
 from typing import Callable, Optional
 
 import gymnasium as gym
+from lmnr import Laminar
 
 from ehr_gym.env.action.action_set import ACTION_SET
 from ehr_gym.env.chat import Chat
 from ehr_gym.env.spaces import AnyDict, Float, Unicode
 from ehr_gym.env.task.base import AbstractEHRTask
 from ehr_gym.env.task.substitution import insert_solution
-from ehr_gym.llm.chat_api import AzureModelArgs
+from ehr_gym.llm.chat_api import make_chat_model
 
 logger = logging.getLogger(__name__)
 
@@ -71,14 +72,7 @@ class EHREnv(gym.Env, ABC):
         # initialize chat
         self.chat: Chat = None
 
-        debugger_config = self.task_kwargs.get("debugger_config", None)
-        self.debugger = AzureModelArgs(
-            model_name=debugger_config["model_name"],
-            temperature=debugger_config["temperature"],
-            max_new_tokens=debugger_config["max_new_tokens"],
-            deployment_name=debugger_config["deployment_name"],
-            log_probs=debugger_config["log_probs"],
-        ).make_model()
+        self.debugger = make_chat_model(self.task_kwargs.get("debugger_config"))
         self.env_history = []
         self.need_context = False
 
@@ -167,6 +161,20 @@ class EHREnv(gym.Env, ABC):
             done: whether the environment is done.
             info: additional information about the environment.
         """
+        name = action if action in self.action_mapping else "invalid_action"
+        with Laminar.start_as_current_span(f"env.{name}", input=kwargs, span_type="TOOL"):
+            obs, reward, done, truncated, info = self._step(action, **kwargs)
+            Laminar.set_span_output(
+                {
+                    "type": obs["type"],
+                    "reward": reward,
+                    "done": done,
+                    "env_message": obs.get("env_message"),
+                }
+            )
+            return obs, reward, done, truncated, info
+
+    def _step(self, action: str, **kwargs) -> tuple:
         # save the action
 
         self.last_action = action
@@ -216,6 +224,13 @@ class EHREnv(gym.Env, ABC):
         logger.debug(f"Initiating task validation")
         reward, done, user_message, task_info = self._task_validate(obs)
         info["task_info"] = task_info
+        # The grader's verdict is the only signal that a program which ran fine
+        # still produced the wrong answer. Upstream computed it and dropped it
+        # here, so the agent saw nothing but its own stdout and resubmitted the
+        # same code until the step budget ran out.
+        feedback = task_info.get("message")
+        if feedback and feedback != obs.get("env_message"):
+            obs["env_message"] = f"{obs.get('env_message', '')}\n\n{feedback}".strip()
         logger.debug(f"Task validated")
 
         # new step API wants a 5-tuple (gymnasium style)

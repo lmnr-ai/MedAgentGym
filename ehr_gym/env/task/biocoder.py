@@ -97,7 +97,7 @@ class BiocoderTask(AbstractEHRTask):
                 f"({self.code_id}) failed; this datapoint is not gradable:\n"
                 f"{result['env_message']}"
             )
-        self.answer = result["env_message"]
+        self.answer = result["stdout"]
         goal, info = self.setup_goal()
         return goal, info
 
@@ -131,7 +131,7 @@ class BiocoderTask(AbstractEHRTask):
 
     def validate(self, chat_messages, obs):
         if obs["type"] == "code_execution":
-            pred = obs['env_message']
+            pred = obs.get("stdout", obs["env_message"])
             correctness = self.answer == pred
             if correctness:
                 return (

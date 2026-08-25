@@ -150,7 +150,7 @@ Question: {self.question}\n. The FHIR server base URL is {self.fhir_api_base}. D
         """
         
         if obs["type"] == "code_execution":
-            pred = obs['env_message']
+            pred = obs.get("stdout", obs["env_message"])
             if type(self.answer) == list:
                 ans = self.answer[0]
             else:

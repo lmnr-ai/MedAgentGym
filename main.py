@@ -6,8 +6,10 @@ import time
 
 import toml
 from joblib import Parallel, delayed
+from lmnr import Laminar
 
-from ehr_gym.agent.base import EHRAgent
+from ehr_gym import tracing
+from ehr_gym.agent.base import LLM_FAILURE, EHRAgent
 from ehr_gym.env.base import EHREnv
 from ehr_gym.utils.general import load_config, save_conversation_history
 
@@ -83,6 +85,26 @@ def history_path(save_dir, idx, rollout_idx, num_rollouts):
 
 def run_single_rollout(args, config, idx, rollout_idx, output_path):
     """Run one trajectory for task `idx` and persist it. Returns 1 on success."""
+    with Laminar.start_as_current_span(
+        f"{args.task}[{args.mode}/{idx}]",
+        input={"task": args.task, "mode": args.mode, "index": idx, "rollout": rollout_idx},
+        session_id=args.result_dir_tag,
+        tags=[args.task, args.mode],
+        metadata={
+            "task": args.task,
+            "mode": args.mode,
+            "index": idx,
+            "rollout": rollout_idx,
+            "model": config["Agent"]["llm"]["model_name"],
+            "num_steps": args.num_steps,
+        },
+    ):
+        result = _rollout(args, config, idx, output_path)
+        Laminar.set_span_output(result)
+        return result["success"]
+
+
+def _rollout(args, config, idx, output_path):
     agent_config = config["Agent"]
     task_cls = get_task_class(args.task)
     env = EHREnv(
@@ -98,21 +120,25 @@ def run_single_rollout(args, config, idx, rollout_idx, output_path):
 
     attempts = 0
     done = False
-    for _ in range(args.num_steps):
-        action, params = agent.act(obs)
-        while action == "error":
-            logger.error(
-                f"Task {args.task}-{idx} failure: agent action failed "
-                f"for {agent_config['n_retry']} times."
-            )
-            attempts += 1
-            if attempts >= config["Env"]["n_retry"]:
-                agent.conversation_history.append({"result": "failure"})
-                save_conversation_history(agent.conversation_history, output_path)
-                return 0
-            time.sleep(1)
+    reward = 0
+    steps = 0
+    for step in range(args.num_steps):
+        steps = step + 1
+        with Laminar.start_as_current_span(f"step {step}"):
             action, params = agent.act(obs)
-        obs, reward, done, _, _ = env.step(action, **params)
+            while action.startswith(LLM_FAILURE):
+                logger.error(
+                    f"Task {args.task}-{idx} failure: agent action failed "
+                    f"for {agent_config['n_retry']} times."
+                )
+                attempts += 1
+                if attempts >= config["Env"]["n_retry"]:
+                    agent.conversation_history.append({"result": "failure"})
+                    save_conversation_history(agent.conversation_history, output_path)
+                    return {"success": 0, "score": 0, "steps": steps, "reason": action}
+                time.sleep(1)
+                action, params = agent.act(obs)
+            obs, reward, done, _, _ = env.step(action, **params)
         if done:
             break
 
@@ -121,11 +147,19 @@ def run_single_rollout(args, config, idx, rollout_idx, output_path):
     else:
         agent.conversation_history.append({"result": "failure"})
     save_conversation_history(agent.conversation_history, output_path)
-    return 1 if done else 0
+    return {
+        "success": 1 if done else 0,
+        "score": reward,
+        "steps": steps,
+        "reason": "solved" if done else "step budget exhausted",
+    }
 
 
 def run_single_experiment(args, config, idx):
     """Run every requested rollout for task `idx`, skipping ones already on disk."""
+    # This is the joblib entry point, so it is also the first thing that runs in
+    # a worker process -- and therefore where tracing has to be set up.
+    tracing.initialize()
     save_dir = os.path.join(args.work_dir, args.task, args.result_dir_tag, args.mode)
     os.makedirs(save_dir, exist_ok=True)
     successes = 0
@@ -135,7 +169,10 @@ def run_single_experiment(args, config, idx):
             logger.info(f"Trajectory {output_path} already exists. Skipping...")
             continue
         logger.info(f"Running experiment for index {idx} (rollout {rollout_idx})...")
-        successes += run_single_rollout(args, config, idx, rollout_idx, output_path)
+        try:
+            successes += run_single_rollout(args, config, idx, rollout_idx, output_path)
+        finally:
+            tracing.flush()
     return successes
 
 

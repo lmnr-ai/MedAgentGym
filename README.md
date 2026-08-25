@@ -70,6 +70,14 @@ Per-dataset notes:
   whose own reference fails their assertions.
 - MedCalcBench's grader compared everything as a float, so the 60 date and
   gestational-age answers could never pass. It now parses each answer shape.
+- The grader's verdict never reached the agent: `validate()` computed "the answer is
+  incorrect" and `env.step` threw it away, so a model that ran a working program with a
+  wrong answer saw only its own stdout and resubmitted the same code until the step
+  budget ran out. The verdict is now appended to the observation.
+- Grading used stdout **and** stderr, so a submission that merely emitted a
+  `UserWarning` scored 0. Rewards now come from stdout alone, which is what
+  `scripts/filter_biocoder.py` picked the keep set with; the agent is still shown stderr.
+- Every rollout is traced to [Laminar](https://www.lmnr.ai/) — see *Tracing* below.
 
 ### Setup
 
@@ -112,6 +120,51 @@ Useful flags:
 
 Trajectories land in `<work_dir>/<task>/<result_dir_tag>/<mode>/history_*.json`. Existing
 files are skipped, so a run can be resumed by re-invoking the same command.
+
+`data/smoke_indices.json` holds ten indices per dataset, for a cheap end-to-end check:
+
+```bash
+uv run python main.py --config_path configs/gpt_5_6_luna/exp-gpt_5_6_luna-medcalcbench.yaml \
+  --rollout_indices_path data/smoke_indices.json --n_jobs 1
+```
+
+### Models
+
+`model_type` in a config selects the client:
+
+| `model_type` | Client | Needs |
+| --- | --- | --- |
+| `Foundry` | Azure AI Foundry's OpenAI-compatible `/openai/v1` | `AZURE_OPENAI_ENDPOINT`, `AZURE_API_KEY` |
+| `Azure` | classic Azure OpenAI, routed by deployment name | `AZURE_OPENAI_API_KEY`, `API_VERSION` |
+| `OpenAI` | OpenAI | `OPENAI_API_KEY` |
+
+Deployments disagree about which sampling parameters they accept — GPT-5 models reject
+`temperature` and renamed `max_tokens` to `max_completion_tokens`. Rather than sniffing
+model names, `ehr_gym/llm/chat_api.py` sends everything, reads the 400 the API returns,
+and retries without the offending parameter; the lesson is cached per model, so each
+worker pays for it once.
+
+Give reasoning models a large `max_new_tokens`. Reasoning tokens are billed against the
+same ceiling as the answer, so a budget that looks generous can be spent entirely on
+thinking and return truncated JSON — which reaches the parser as a formatting failure.
+The `gpt_5_6_luna` configs use 32768.
+
+### Tracing
+
+Set `LMNR_PROJECT_API_KEY` (in `credentials.toml`) and every rollout becomes a Laminar
+trace; leave it unset and the SDK is never initialized, so nothing else changes.
+
+```
+<task>[<mode>/<idx>]          root span, one per trajectory, session = result_dir_tag
+  step 0
+    agent.act                 the prompt the agent saw and the action it chose
+      openai.chat             from the SDK's OpenAI auto-instrumentation
+    env.validate_code         the action's arguments, its reward, and the feedback
+```
+
+Rollouts run in joblib worker *processes*, which do not inherit the parent's tracer
+provider, so `ehr_gym/tracing.py` initializes inside the worker and flushes after every
+rollout — a worker can be torn down without running interpreter shutdown hooks.
 
 ### Running in Docker
 

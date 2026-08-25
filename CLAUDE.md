@@ -27,7 +27,12 @@ Only four datasets remain: `biocoder`, `biodsbench`, `medagentbench`, `medcalcbe
 - `scripts/` — one-off maintenance: `fetch_biodsbench_data.py` downloads the study data,
   `filter_biocoder.py` / `filter_biodsbench.py` drop ungradable rows and rewrite
   `data/metadata.json`. Shared subprocess helpers live in `scripts/_common.py`.
-- `ehr_gym/llm/chat_api.py` — Azure OpenAI / OpenAI clients only. No local model serving.
+- `ehr_gym/llm/chat_api.py` — Azure Foundry / Azure OpenAI / OpenAI clients only. No local
+  model serving. `make_chat_model(config)` is the single constructor; `MODEL_ARGS` maps
+  `model_type` to the args dataclass, and only fields the dataclass declares are passed
+  through, so configs can carry extra keys.
+- `ehr_gym/tracing.py` — Laminar setup. Everything else calls `Laminar.*` unguarded;
+  those are no-ops until `initialize()` runs.
 
 ## Environment
 
@@ -52,7 +57,50 @@ Only four datasets remain: `biocoder`, `biodsbench`, `medagentbench`, `medcalcbe
   to `git clean -fd` afterwards. Anything *we* write that runs scraped task code should go
   through `scripts/_common.run_python`, which uses a temp cwd.
 
+## Calling models
+
+- **Do not sniff model names to decide which sampling parameters to send.** `chat_api.py`
+  sends everything, parses the 400 (`unsupported_parameter` / `unsupported_value`) and
+  retries without the offending parameter, caching the lesson per model name in `_QUIRKS`.
+  Quirk retries deliberately do *not* consume `max_retry`, which is reserved for 429s and
+  outages. gpt-5.6-luna needs both branches: `max_tokens` → `max_completion_tokens`
+  (rename, taken from the error message) and `temperature` (dropped outright — it only
+  accepts the default 1).
+- **Reasoning tokens count against `max_completion_tokens`.** A gpt-5.6-luna call with a
+  600-token ceiling returns `finish_reason: "length"`, `reasoning_tokens: 600` and *empty*
+  content. In the harness that surfaces as "the model cannot produce valid JSON", not as a
+  budget problem, so `__call__` logs a warning on `finish_reason == "length"`. Keep
+  `max_new_tokens` in the tens of thousands for reasoning models.
+- gpt-5.6-luna's rate limit is tight enough that `--n_jobs 1` is the safe setting; the
+  429 backoff is 10s doubling, and four exhausted retries abandon the trajectory.
+
+## Tracing
+
+Every rollout is a Laminar trace (root span `<task>[<mode>/<idx>]`, session =
+`result_dir_tag`), with `step N` → `agent.act` → `openai.chat` and a sibling `env.<action>`
+span carrying the reward. Two things are easy to get wrong:
+
+- joblib `prefer="processes"` workers do **not** inherit the parent's tracer provider, so
+  `tracing.initialize()` runs inside `run_single_experiment`, not in `main()`.
+- A worker can exit without running interpreter shutdown hooks, so every rollout ends in a
+  `tracing.flush()`.
+
+Production `api.lmnr.ai` does not expose `/v1/sql/query` or `/v1/projects/current`, so
+traces cannot be read back programmatically to confirm delivery. The working check is
+differential: a bogus key logs `Failed to export traces to api.lmnr.ai:8443, error code:
+StatusCode.UNAUTHENTICATED` and a good key logs nothing.
+
 ## Grading, per dataset (all execution-based; there is no LLM-as-a-judge anywhere)
+
+- **Rewards come from stdout, feedback comes from stdout + stderr.** `validate_code`
+  returns both `env_message` (combined, what the agent debugs from) and `stdout` (what
+  tasks grade on). They were the same field, which made a submission that emitted a
+  `UserWarning` fail even when it was behaviourally identical to the reference — and it
+  contradicted `scripts/filter_biocoder.py`, which picked the keep set on stdout alone.
+- **`task.validate()`'s `task_info["message"]` is the agent's only signal that a working
+  program gave a wrong answer.** `env._step` appends it to `obs["env_message"]`. Without
+  that the agent sees nothing but its own output and resubmits byte-identical code for the
+  whole step budget — the dominant failure mode in the first smoke run.
 
 - **BioCoder** (496 train / 149 test) — ground truth is generated at `setup()` time by
   *executing the reference program and capturing stdout*, then compared to the agent's
@@ -93,3 +141,10 @@ Only four datasets remain: `biocoder`, `biodsbench`, `medagentbench`, `medcalcbe
   `result_dir_tag` when you want a genuinely fresh run.
 - `--num_rollouts K > 1` changes the filename to `history_<idx>_<rollout>.json`; the
   single-rollout name has no suffix. Don't mix the two in one `result_dir_tag`.
+- `data/smoke_indices.json` is the ten-per-dataset sample for end-to-end checks. It has no
+  `medagentbench` key on purpose: that dataset needs a Docker FHIR server.
+- `agent.act` returns `LLM_FAILURE` (`"error: llm"`) or `PARSE_FAILURE`
+  (`"error: invalid response"`). `env._step` routes anything containing `"error"` back to
+  the model as feedback; only `LLM_FAILURE` abandons a rollout, because a malformed
+  response is something the model can fix next turn and an unreachable API is not. Match
+  these with `startswith`, not `==` — upstream's `while action == "error"` was dead code.

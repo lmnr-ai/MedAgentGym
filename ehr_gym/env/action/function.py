@@ -90,6 +90,14 @@ def validate_code(code: str) -> dict[str, Any]:
         "type": "code_execution",
         "status": "SUCCESS" if success else "FAILED",
         "env_message": output,
+        # What gets *graded*, as opposed to what the agent is shown. stderr stays
+        # in `env_message` because warnings and tracebacks are what the agent
+        # debugs from, but it must not decide the reward: a submission that is
+        # behaviourally identical to the reference still emits its own warnings,
+        # and `scripts/filter_biocoder.py` already picked the keep set on stdout
+        # alone. A failed run grades on the error text so an empty stdout can
+        # never be mistaken for a silent correct answer.
+        "stdout": stdout if success else output,
         "execution_time": f"{execution_time:.2f}s",
     }
 

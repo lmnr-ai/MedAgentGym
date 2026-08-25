@@ -1,15 +1,24 @@
 import time
 from typing import Any
 
+from lmnr import Laminar
+
 from ehr_gym.agent.parser import parse_llm_response
 from ehr_gym.agent.prompt import DynamicPrompt
 from ehr_gym.llm.chat_api import (
-    AzureModelArgs,
-    OpenAIModelArgs,
     make_assistant_message,
+    make_chat_model,
     make_system_message,
     make_user_message,
 )
+
+
+# Both failure modes have to be visible to `env.step`, which routes anything
+# containing "error" straight back to the model as feedback. Only the first is
+# worth abandoning a trajectory over: an unparseable response is something the
+# model can fix on the next turn, an unreachable API is not.
+LLM_FAILURE = "error: llm"
+PARSE_FAILURE = "error: invalid response"
 
 
 class EHRAgent:
@@ -19,25 +28,7 @@ class EHRAgent:
         self.agent_config = agent_config
         self.llm_config = agent_config["llm"]
 
-        if self.llm_config["model_type"] == "OpenAI":
-            self.llm = OpenAIModelArgs(
-                model_name=self.llm_config["model_name"],
-                max_total_tokens=self.llm_config["max_total_tokens"],
-                max_input_tokens=self.llm_config["max_input_tokens"],
-                max_new_tokens=self.llm_config["max_new_tokens"],
-                temperature=self.llm_config["temperature"],
-                vision_support=False,
-            ).make_model()
-        elif self.llm_config["model_type"] == "Azure":
-            self.llm = AzureModelArgs(
-                model_name=self.llm_config["model_name"],
-                temperature=self.llm_config["temperature"],
-                max_new_tokens=self.llm_config["max_new_tokens"],
-                deployment_name=self.llm_config["deployment_name"],
-                log_probs=self.llm_config["log_probs"],
-            ).make_model()
-        else:
-            raise ValueError("Model type {} not supported.".format(self.llm_config["model_type"]))
+        self.llm = make_chat_model(self.llm_config)
         self.conversation_history = []
         self.prompt = DynamicPrompt()
         self.parser = parse_llm_response
@@ -64,24 +55,28 @@ class EHRAgent:
             user_msg = make_user_message(content=obs["env_message"])
         self.conversation_history.append(user_msg)
 
-        for _ in range(self.agent_config["n_retry"]):
-            try:
-                response, cost = self.llm(self.conversation_history)
-                response = response.content
-                self.cost.append(cost)
-            except Exception as e:
-                print("Error Message ", e)
-                time.sleep(self.agent_config["retry_delay"])
-                action, params = f"error: str({e})", {}
-                continue
-            try:
-                action, params = self.parser(response)
-            except Exception as e:
-                print("Error Message ", e)
-                time.sleep(self.agent_config["retry_delay"])
-                action, params = f"error: str({e})", {}
-                response = f"Error: {e}. Please regenerate the action."
-            self.conversation_history.append(make_assistant_message(content=response))
-            break
+        with Laminar.start_as_current_span("agent.act", input=user_msg["content"]):
+            for _ in range(self.agent_config["n_retry"]):
+                try:
+                    response, cost = self.llm(self.conversation_history)
+                    response = response.content
+                    self.cost.append(cost)
+                except Exception as e:
+                    print("Error Message ", e)
+                    time.sleep(self.agent_config["retry_delay"])
+                    action, params = f"{LLM_FAILURE}: {e}", {}
+                    continue
+                try:
+                    action, params = self.parser(response)
+                except Exception as e:
+                    print("Error Message ", e)
+                    action, params = f"{PARSE_FAILURE}: {e}", {}
+                # The response goes in verbatim even when it did not parse: the
+                # environment feeds the parse error back as the next user turn,
+                # and that only reads as a correction if the turn it corrects is
+                # actually in the transcript.
+                self.conversation_history.append(make_assistant_message(content=response))
+                break
+            Laminar.set_span_output({"action": action, "params": params})
 
         return action, params
