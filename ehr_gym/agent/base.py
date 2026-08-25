@@ -50,10 +50,22 @@ class EHRAgent:
                 format_output=action_formats,
             )
             self.conversation_history.append(make_system_message(content=system_msg))
+
+        # Which turn to send is a property of the observation, not of how much
+        # history there is. An `act` that gave up on the API leaves its prompt in
+        # the history and is called again with the *same* observation, so keying
+        # the choice off an empty history took the wrong branch on that retry and
+        # read `env_message` from the initial observation, which has no such key.
+        if obs["type"] == "initial_observation":
             user_msg = make_user_message(content=obs["info"]["task_goal"])
         else:
             user_msg = make_user_message(content=obs["env_message"])
-        self.conversation_history.append(user_msg)
+        # That same retry re-sends a turn already in the history. Appending it
+        # again would put two identical user messages back to back, which some
+        # APIs reject outright. Nothing else can reach this: every other path
+        # ends with the assistant's reply, even when it failed to parse.
+        if self.conversation_history[-1] != user_msg:
+            self.conversation_history.append(user_msg)
 
         with Laminar.start_as_current_span("agent.act", input=user_msg["content"]):
             for _ in range(self.agent_config["n_retry"]):

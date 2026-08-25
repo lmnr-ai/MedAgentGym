@@ -148,3 +148,8 @@ StatusCode.UNAUTHENTICATED` and a good key logs nothing.
   the model as feedback; only `LLM_FAILURE` abandons a rollout, because a malformed
   response is something the model can fix next turn and an unreachable API is not. Match
   these with `startswith`, not `==` — upstream's `while action == "error"` was dead code.
+  Because that retry loop is now live, `act()` has to be safe to call twice with the *same*
+  observation: it picks the turn to send from `obs["type"]`, not from whether the history
+  is empty, and skips the append when that turn is already the last one. Both branches are
+  only reachable after an `LLM_FAILURE`, which leaves a prompt in the history with no
+  assistant reply after it.
