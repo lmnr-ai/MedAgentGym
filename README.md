@@ -248,6 +248,8 @@ Things worth knowing before the first run:
   behind (matched on the `medagentgym` label, so nothing else on the account is touched),
   waits for each to finish, unpacks its `workdir/` and deletes it. Pass `--extend-ttl` when
   adopting: a sandbox's TTL runs from creation, and the run has already spent some of it.
+  It is safe to run while another run is in flight — sandboxes are paired by run id, not by
+  shard number, so a finished `shard-0` cannot delete a different run's `shard-0` server.
 
 ## Results
 

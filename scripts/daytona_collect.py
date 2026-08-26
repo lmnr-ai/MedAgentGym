@@ -61,28 +61,72 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def probe(sandbox, cmd: str) -> str | None:
+def probe(sandbox, cmd: str, timeout: int = 60):
     """Run `cmd` in the sandbox, or return None if it could not be asked.
 
     A sandbox running a shard is busy, and `exec` against a busy daemon fails
     often enough that treating a failed probe as a verdict would throw away
     finished work. The caller polls again instead.
+
+    Returns the whole response rather than its output, because a non-zero exit
+    means opposite things to different callers here: `cat /tmp/exit_code` exits 1
+    on every shard that is still running, which is the answer and not a problem,
+    while a `tar` that exits non-zero has written no archive to download.
     """
     try:
-        return (sandbox.process.exec(cmd, cwd=REMOTE_REPO, timeout=60).result or "").strip()
+        return sandbox.process.exec(cmd, cwd=REMOTE_REPO, timeout=timeout)
     except DaytonaError:
         return None
 
 
+def said(response) -> str:
+    """What a probe printed, or the empty string if it was never asked."""
+    return (response.result or "").strip() if response else ""
+
+
 def collect(sandbox, args: argparse.Namespace, label: str) -> bool:
-    """Download the shard's trajectories. False if the sandbox could not be read."""
-    if probe(sandbox, "tar czf /tmp/workdir.tgz --exclude=running_records.jsonl workdir") is None:
-        print(f"[{label}] finished, but the archive could not be built; retrying next poll")
+    """Download the shard's trajectories. False if there is nothing to unpack yet."""
+    # `tar`'s exit code, not just whether it could be run: a shard that died
+    # before creating `workdir/`, or one that filled its disk, leaves no archive
+    # behind -- and `download_file` on a path that is not there raises out of the
+    # whole adoption loop, taking every shard not yet collected with it. Ten
+    # minutes because a full run's `workdir/` is thousands of files, and a `tar`
+    # that outlives its timeout looks exactly like an unreachable sandbox.
+    archive = probe(
+        sandbox, "tar czf /tmp/workdir.tgz --exclude=running_records.jsonl workdir", timeout=600
+    )
+    if archive is None or archive.exit_code != 0:
+        why = (
+            "the sandbox would not answer"
+            if archive is None
+            else f"tar exited {archive.exit_code}: {said(archive)}"
+        )
+        print(f"[{label}] finished, but there is no archive to download -- {why}")
         return False
-    blob = sandbox.fs.download_file("/tmp/workdir.tgz")
-    with tarfile.open(fileobj=io.BytesIO(blob)) as tar:
-        tar.extractall(args.output_dir, **TAR_EXTRACT_KWARGS)
+    try:
+        blob = sandbox.fs.download_file("/tmp/workdir.tgz")
+        with tarfile.open(fileobj=io.BytesIO(blob)) as tar:
+            tar.extractall(args.output_dir, **TAR_EXTRACT_KWARGS)
+    except (DaytonaError, tarfile.TarError, OSError) as e:
+        # Same reason: one shard's bad download is not a reason to abandon the
+        # shards that have not been collected yet.
+        print(f"[{label}] could not unpack the archive: {e}")
+        return False
     return True
+
+
+def pairing(sandbox) -> tuple[str, str] | None:
+    """Which run and shard a sandbox belongs to, or None if it cannot be said.
+
+    Shard names repeat across runs, so the run id is the half that makes the pair
+    unique -- pairing on the shard name alone lets a finished `shard-0` of any
+    task delete another run's `shard-0/fhir` while its own worker is still
+    grading against it. A sandbox from before the `run` label existed cannot be
+    attributed to a run at all, so it is left alone rather than guessed at.
+    """
+    run = sandbox.labels.get("run")
+    shard = sandbox.labels.get("shard")
+    return (run, shard) if run and shard else None
 
 
 def main() -> None:
@@ -96,8 +140,17 @@ def main() -> None:
     workers = [s for s in mine if s.labels["medagentgym"] != FHIR_LABEL]
     if args.task:
         workers = [s for s in workers if s.labels["medagentgym"] in args.task]
-    # Keyed by the shard label the worker will name when it is done with it.
-    servers = {s.labels.get("shard"): s for s in mine if s.labels["medagentgym"] == FHIR_LABEL}
+    # Keyed by the run and shard its worker carries, which is the only pair that
+    # is unique across the account. An unattributable server is kept out of the
+    # index entirely, so nothing can pop it by accident; it is reported at the end.
+    servers = {}
+    orphans = []
+    for server in (s for s in mine if s.labels["medagentgym"] == FHIR_LABEL):
+        key = pairing(server)
+        if key and key not in servers:
+            servers[key] = server
+        else:
+            orphans.append(server)
     if not workers:
         sys.exit("No sandboxes with a `medagentgym` label to collect.")
     print(f"adopting {len(workers)} shards ({len(servers)} FHIR servers) of {len(everything)} sandboxes")
@@ -115,24 +168,29 @@ def main() -> None:
     while pending and time.time() < deadline:
         for sandbox_id, sandbox in list(pending.items()):
             label = f"{sandbox.labels['medagentgym']}/{sandbox.labels.get('shard')}"
-            code = probe(sandbox, f"cat {EXIT_CODE_FILE} 2>/dev/null")
-            if code is None:
+            answer = probe(sandbox, f"cat {EXIT_CODE_FILE} 2>/dev/null")
+            if answer is None:
                 print(f"[{label}] unreachable, will ask again")
                 continue
+            # No exit code check: `cat` on the file a running shard has not
+            # written yet exits 1, and that is the ordinary case here.
+            code = said(answer)
             if not code:
-                done = probe(sandbox, "find workdir -name 'history_*.json' | wc -l")
+                done = said(probe(sandbox, "find workdir -name 'history_*.json' | wc -l"))
                 print(f"[{label}] running, {done or '?'} trajectories written")
                 continue
             print(f"[{label}] exited {code}")
             if code != "0":
-                failures.append((label, code, probe(sandbox, "tail -20 /tmp/run.log") or ""))
+                failures.append((label, code, said(probe(sandbox, "tail -20 /tmp/run.log"))))
             if not collect(sandbox, args, label):
+                print(f"[{label}] nothing collected, retrying next poll")
                 continue
             del pending[sandbox_id]
             if args.keep_sandboxes:
                 continue
             # The shard's FHIR server has no other client, so it goes with it.
-            partner = servers.pop(f"{sandbox.labels.get('shard')}/{FHIR_LABEL}", None)
+            key = pairing(sandbox)
+            partner = servers.pop(key, None) if key else None
             for doomed in (sandbox, partner):
                 if doomed:
                     try:
@@ -149,7 +207,13 @@ def main() -> None:
         print(f"  {label} exited {code}:\n{tail}")
     if pending:
         for sandbox in pending.values():
-            print(f"  still running at timeout: {sandbox.labels['medagentgym']}/{sandbox.labels.get('shard')}")
+            print(f"  still pending at timeout: {sandbox.labels['medagentgym']}/{sandbox.labels.get('shard')}")
+    # A server is only deleted by the worker it belongs to, so any left here
+    # outlived this collection -- its worker is still pending, was filtered out
+    # by `--task`, or (for an orphan) carries no run label to be claimed by. Say
+    # so: the alternative is a sandbox quietly billing until its TTL fires.
+    for server in list(servers.values()) + orphans:
+        print(f"  FHIR server left running: {server.id[:8]} ({server.labels.get('shard')})")
     sys.exit(1 if pending or failures else 0)
 
 

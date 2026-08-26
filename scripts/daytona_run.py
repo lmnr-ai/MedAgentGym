@@ -355,6 +355,7 @@ def start_fhir_sandbox(client: Daytona, args: argparse.Namespace, label: str):
     Daytona token; it holds only MedAgentBench's synthetic patients, but it is
     world-reachable for the life of the run.
     """
+    shard_label = label
     label = f"{label}/fhir"
     print(f"[{label}] building sandbox image from Dockerfile.fhir ...")
     sandbox = client.create(
@@ -362,7 +363,10 @@ def start_fhir_sandbox(client: Daytona, args: argparse.Namespace, label: str):
             image=Image.from_dockerfile(REPO_DIR / "Dockerfile.fhir"),
             public=True,
             os_user="root",
-            labels={"medagentgym": "fhir", "shard": label},
+            # `shard` is the *worker's* label rather than this sandbox's own
+            # name, because it is what pairs the two: with `run`, it is how
+            # `daytona_collect.py` knows whose server this is.
+            labels={"medagentgym": "fhir", "run": args.run_id, "shard": shard_label},
             # HAPI is a JVM holding a ~1.4 GB H2 database open, so it wants more
             # RAM than a worker; 10 GB of disk is the per-sandbox ceiling on the
             # default Daytona plan and is enough for the image.
@@ -416,7 +420,7 @@ def provision(client: Daytona, image, args: argparse.Namespace, creds: dict[str,
     """Create one sandbox and get the repo, its deps and the credentials into it."""
     common = {
         "os_user": "root",
-        "labels": {"medagentgym": args.task, "shard": label},
+        "labels": {"medagentgym": args.task, "run": args.run_id, "shard": label},
         "resources": Resources(cpu=args.cpu, memory=args.memory, disk=args.disk),
         # A shard is hours of silence from Daytona's point of view, which the
         # default 15-minute idle timer would happily stop out from under us.
@@ -577,9 +581,19 @@ def main() -> None:
             "is not reachable from inside a sandbox."
         )
 
+    # Stamped on every sandbox this invocation creates. Shards are named
+    # `shard-0`, `shard-1`, ... in every run, so a shard name only identifies a
+    # sandbox *within* one: without a run id, two runs in flight at once -- or a
+    # re-run of the shards one of them lost -- both own a `shard-0`, and
+    # `daytona_collect.py` cannot tell whose FHIR server is whose. It deletes one
+    # when its worker finishes, so guessing takes a live server out from under a
+    # shard that is still grading against it.
+    args.run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.urandom(2).hex()}"
+
     indices = resolve_indices(args)
     shards = shard(indices, args.sandboxes)
-    print(f"{len(indices)} tasks across {len(shards)} sandboxes ({args.n_jobs} joblib workers each)")
+    print(f"run {args.run_id}: {len(indices)} tasks across {len(shards)} sandboxes "
+          f"({args.n_jobs} joblib workers each)")
 
     client = Daytona(DaytonaConfig(api_key=os.environ["DAYTONA_API_KEY"]))
     image = None if args.snapshot else Image.from_dockerfile(REPO_DIR / "Dockerfile.daytona")

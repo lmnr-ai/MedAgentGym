@@ -158,6 +158,15 @@ flags. The non-obvious parts:
 - Credentials are uploaded as a `credentials.toml`, not passed as `env_vars`, so they stay
   out of sandbox metadata. `set_environment_variables()` exports every key of that file,
   which is also how `MEDAGENTBENCH_FHIR_URL` reaches the task module.
+- **Sandbox labels are the only handle a second process has on a run, and only
+  `(run, shard)` is unique.** Every sandbox carries `medagentgym` (the task, or `fhir`),
+  `run` (`args.run_id`, one per invocation of `daytona_run.py`) and `shard` (`shard-0`,
+  `shard-1`, …, and on a FHIR sandbox it is *its worker's* name, which is what pairs the
+  two). Shard numbering restarts at 0 every run, so pairing on it alone lets any finished
+  `shard-0` — of any task, from any run — claim and delete another run's `shard-0` FHIR
+  server while that shard is still grading against it. `daytona_collect.py` therefore keys
+  its server index on `pairing()`, and a sandbox with no `run` label is left alone rather
+  than guessed at.
 - A shard is started with `nohup` and polled for `/tmp/exit_code` rather than run as one
   long `exec`: a multi-hour HTTP response is at the mercy of every proxy in between.
   Sandboxes are created with `auto_stop_interval=0` (the 15-minute idle timer would stop a
