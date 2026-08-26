@@ -73,6 +73,11 @@ REMOTE_REPO = "/home/MedAgentGym"
 REMOTE_VENV = "/home/.venv"
 DEFAULT_REPO_URL = "https://github.com/lmnr-ai/MedAgentGym.git"
 FHIR_PORT = 8080
+# How a shard reports itself to a driver that can only ask over a flaky `exec`:
+# the first thing the job does is touch one file, the last is write its exit code
+# to the other.
+STARTED_FILE = "/tmp/run.started"
+EXIT_CODE_FILE = "/tmp/exit_code"
 # What `--ref` has to look like to be treated as a commit rather than a branch.
 # `git.clone` takes the two on different keyword arguments and the server clones
 # with `--branch`, which does not accept a SHA -- so a pinned commit passed as a
@@ -200,6 +205,62 @@ def run_remote(sandbox, command: str, timeout: int, label: str) -> str:
     return response.result or ""
 
 
+def shard_state(sandbox) -> str:
+    """Whether this sandbox's shard is `done`, `running`, `idle` or `unknown`.
+
+    `unknown` means the sandbox would not answer, which is not the same as
+    `idle`: the caller uses this to decide whether to start the job, and
+    mistaking a running shard for an idle one starts a second copy of it.
+    """
+    # Marker files rather than `pgrep`: `procps` is not in the image, and a
+    # missing `pgrep` reports every running shard as idle -- the one wrong answer
+    # that does damage. The marker is the first thing the job writes.
+    try:
+        probe = sandbox.process.exec(
+            f"if [ -f {EXIT_CODE_FILE} ]; then echo done; "
+            f"elif [ -f {STARTED_FILE} ]; then echo running; "
+            "else echo idle; fi",
+            cwd=REMOTE_REPO,
+            timeout=60,
+        )
+    except DaytonaError:
+        return "unknown"
+    return (probe.result or "").strip() or "unknown"
+
+
+def launch(sandbox, inner: str, label: str, attempts: int = 5) -> None:
+    """Start the shard in the background, retrying a flaky `exec`.
+
+    Daytona's `exec` answers `command execution timeout` often enough under load
+    to lose a shard on the one call that starts it -- and it says that whether or
+    not the command it was given actually started, so a blind retry can leave two
+    copies of the run racing over the same output files. Ask the sandbox first.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            sandbox.process.exec(
+                f"rm -f {EXIT_CODE_FILE} {STARTED_FILE} && "
+                f"nohup bash -c {shlex.quote(inner)} > /tmp/run.log 2>&1 & echo started",
+                cwd=REMOTE_REPO,
+                timeout=60,
+            )
+            return
+        except DaytonaError as e:
+            print(f"[{label}] launch attempt {attempt}/{attempts} failed: {e}")
+            time.sleep(15)
+            state = shard_state(sandbox)
+            if state in ("running", "done"):
+                print(f"[{label}] the shard started anyway ({state})")
+                return
+            if state == "unknown":
+                # Neither "it is running" nor "it is not", so starting another
+                # one is not safe. Waiting is: the poll loop below tolerates a
+                # silent sandbox, and `deadline` still bounds the whole thing.
+                print(f"[{label}] sandbox not answering, waiting before retrying")
+                time.sleep(45)
+    raise RuntimeError(f"[{label}] could not start the shard in {attempts} attempts")
+
+
 def run_detached(sandbox, argv: list[str], timeout: int, label: str) -> int:
     """Start `argv` in the background and poll until it writes its exit code.
 
@@ -214,13 +275,8 @@ def run_detached(sandbox, argv: list[str], timeout: int, label: str) -> int:
     or terminate the quoting -- and the failure is silent, since the job that
     never starts also never writes the exit code this polls for.
     """
-    inner = f"{shlex.join(argv)}; echo $? > /tmp/exit_code"
-    sandbox.process.exec(
-        f"rm -f /tmp/exit_code && nohup bash -c {shlex.quote(inner)} "
-        f"> /tmp/run.log 2>&1 & echo started",
-        cwd=REMOTE_REPO,
-        timeout=60,
-    )
+    inner = f"touch {STARTED_FILE}; {shlex.join(argv)}; echo $? > {EXIT_CODE_FILE}"
+    launch(sandbox, inner, label)
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(30)
@@ -231,7 +287,7 @@ def run_detached(sandbox, argv: list[str], timeout: int, label: str) -> int:
         # `deadline` is what ends this loop.
         try:
             probe = sandbox.process.exec(
-                "cat /tmp/exit_code 2>/dev/null", cwd=REMOTE_REPO, timeout=60
+                f"cat {EXIT_CODE_FILE} 2>/dev/null", cwd=REMOTE_REPO, timeout=60
             )
             code = (probe.result or "").strip()
             if code:
