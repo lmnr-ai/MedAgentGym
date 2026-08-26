@@ -108,7 +108,7 @@ Both filters rewrite the task files in place and update `data/metadata.json`; pa
 ### Run an experiment
 
 ```bash
-uv run python main.py --config_path configs/gpt_4_1_mini/exp-gpt_4_1_mini-biocoder.yaml --n_jobs 5
+uv run python main.py --config_path configs/gpt_5_6_luna/exp-gpt_5_6_luna-biocoder.yaml --n_jobs 5
 ```
 
 Useful flags:
@@ -133,24 +133,21 @@ uv run python main.py --config_path configs/gpt_5_6_luna/exp-gpt_5_6_luna-medcal
 
 ### Models
 
-`model_type` in a config selects the client:
+One deployment: `gpt-5.6-luna` on Azure AI Foundry's OpenAI-compatible `/openai/v1`,
+reached with `AZURE_OPENAI_ENDPOINT` and `AZURE_API_KEY`. The call shape is hard-coded in
+`ehr_gym/llm/chat_api.py` rather than assembled from the config, so a config cannot
+describe a request the deployment will reject:
 
-| `model_type` | Client | Needs |
-| --- | --- | --- |
-| `Foundry` | Azure AI Foundry's OpenAI-compatible `/openai/v1` | `AZURE_OPENAI_ENDPOINT`, `AZURE_API_KEY` |
-| `Azure` | classic Azure OpenAI, routed by deployment name | `AZURE_OPENAI_API_KEY`, `API_VERSION` |
-| `OpenAI` | OpenAI | `OPENAI_API_KEY` |
+- no `temperature` — this generation takes only its default and 400s on any other value,
+  including the `0.0` a benchmark run would otherwise want;
+- `max_completion_tokens`, not `max_tokens`, which this generation 400s on by name.
 
-Deployments disagree about which sampling parameters they accept — GPT-5 models reject
-`temperature` and renamed `max_tokens` to `max_completion_tokens`. Rather than sniffing
-model names, `ehr_gym/llm/chat_api.py` sends everything, reads the 400 the API returns,
-and retries without the offending parameter; the lesson is cached per model, so each
-worker pays for it once.
+Each of those was a rejected call per worker process before the agent's first real turn.
+A config chooses only `model_name` and `max_new_tokens`.
 
-Give reasoning models a large `max_new_tokens`. Reasoning tokens are billed against the
-same ceiling as the answer, so a budget that looks generous can be spent entirely on
-thinking and return truncated JSON — which reaches the parser as a formatting failure.
-The `gpt_5_6_luna` configs use 32768.
+Give `max_new_tokens` plenty of room. Reasoning tokens are billed against the same ceiling
+as the answer, so a budget that looks generous can be spent entirely on thinking and return
+truncated JSON — which reaches the parser as a formatting failure. The configs use 32768.
 
 ### Tracing
 

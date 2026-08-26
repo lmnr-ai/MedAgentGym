@@ -29,10 +29,15 @@ Only four datasets remain: `biocoder`, `biodsbench`, `medagentbench`, `medcalcbe
   `data/metadata.json`. Shared subprocess helpers live in `scripts/_common.py`.
   `daytona_run.py` is the odd one out: it is a *driver*, run on a dev machine, and the
   only thing in the repo that needs the `daytona` extra — see below.
-- `ehr_gym/llm/chat_api.py` — Azure Foundry / Azure OpenAI / OpenAI clients only. No local
-  model serving. `make_chat_model(config)` is the single constructor; `MODEL_ARGS` maps
-  `model_type` to the args dataclass, and only fields the dataclass declares are passed
-  through, so configs can carry extra keys.
+- `ehr_gym/llm/chat_api.py` — one client, `gpt-5.6-luna` on Azure AI Foundry's
+  `/openai/v1`. No local model serving, and no per-model parameterization: **the call shape
+  is hard-coded, deliberately.** This deployment 400s on `max_tokens` (it wants
+  `max_completion_tokens`) and 400s again on any `temperature` but its default, so those
+  two knobs could only ever be set to a rejected call — one wasted request each, in every
+  worker process, before the agent's first real turn. They are not config keys and should
+  not become config keys again for a second model; add a second `ChatModel` instead.
+  `make_chat_model(config)` is the single constructor and reads only `model_name` and
+  `max_new_tokens`.
 - `ehr_gym/tracing.py` — Laminar setup. Everything else calls `Laminar.*` unguarded;
   those are no-ops until `initialize()` runs.
 
@@ -71,12 +76,14 @@ Only four datasets remain: `biocoder`, `biodsbench`, `medagentbench`, `medcalcbe
 
 ## Calling models
 
-- **Which sampling parameters a deployment takes is declared in its config, not discovered.**
-  `temperature: null` means "send no temperature"; `token_param` names the output ceiling.
-  gpt-5.6-luna needs both (`temperature: null`, `token_param: max_completion_tokens`) — it
-  only accepts the default temperature and renamed `max_tokens`. Do not go back to sniffing
-  model names *or* to learning from the 400s: discovery cost two rejected calls in every
-  joblib worker process, and a worker is created per task.
+- **The request shape is hard-coded in `chat_api.py`, not configured and not discovered.**
+  There is one deployment, gpt-5.6-luna, and it 400s on `max_tokens` by name (it wants
+  `max_completion_tokens`) and 400s again on any `temperature` but its default. Those were
+  the only two knobs a config could turn, and both could only be turned to a rejected call,
+  so they are no longer config keys. Do not go back to sniffing model names, to learning
+  from the 400s, or to declaring the shape in YAML: each cost two rejected calls in every
+  joblib worker process, and a worker is created per task. A second deployment means a
+  second `ChatModel`, not a re-parameterized one.
 - A `BadRequestError` is raised immediately rather than retried. It means the request is
   wrong — bad parameter, or a conversation past the context window — and no amount of
   backoff fixes that; `max_retry` is reserved for 429s and outages.

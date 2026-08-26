@@ -1,14 +1,29 @@
-import dataclasses
+"""The one chat deployment this fork runs against.
+
+Every rollout goes to `gpt-5.6-luna` on Azure AI Foundry, so the call shape is
+hard-coded here rather than assembled from the config. The GPT-5 generation
+renamed `max_tokens` to `max_completion_tokens` and accepts no `temperature`
+other than its default, and the deployment answers a 400 for each parameter it
+does not take -- one for the name, one for the value, before any of the agent's
+own work happens. A config knob for either is a knob that can only be turned to
+a rejected call, so there isn't one.
+"""
+
 import logging
 import os
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 
 import openai
-from openai import AzureOpenAI, OpenAI
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
+
+# The output-length ceiling under the name this deployment gives it. Reasoning
+# models spend it on thinking before emitting anything, so it has to clear
+# reasoning *plus* the answer or the response arrives truncated.
+TOKEN_PARAM = "max_completion_tokens"
+MAX_COMPLETION_TOKENS = 32768
 
 
 def make_system_message(content: str) -> dict:
@@ -36,126 +51,46 @@ class AbstractChatModel(ABC):
         return {}
 
 
-@dataclass
-class BaseModelArgs(ABC):
-    """Base class for all model arguments.
+class ChatModel(AbstractChatModel):
+    """`gpt-5.6-luna` on Azure AI Foundry.
 
-    Deployments disagree about sampling parameters: the GPT-5 generation renamed
-    `max_tokens` to `max_completion_tokens` and accepts no `temperature` other
-    than its default. Which shape a deployment wants is declared here -- and so
-    in the config -- rather than discovered from the 400s it sends back, because
-    discovery costs two rejected calls in *every* worker process, and every one
-    of those is a step the agent did not get to take.
+    Foundry's `/openai/v1` speaks plain OpenAI rather than Azure's
+    `deployments/<name>?api-version=` routing, so this is the vanilla client with
+    a `base_url` and there is no deployment name to configure.
     """
 
-    model_name: str
-    max_total_tokens: int | None = None
-    max_input_tokens: int | None = None
-    max_new_tokens: int | None = None
-    # `None` means "send no temperature at all", not "send zero".
-    temperature: float | None = 0.6
-    # The name this deployment gives the output-length ceiling.
-    token_param: str = "max_tokens"
-    vision_support: bool = False
-    log_probs: bool = False
-
-    @abstractmethod
-    def make_model(self) -> AbstractChatModel:
-        pass
-
-
-@dataclass
-class OpenAIModelArgs(BaseModelArgs):
-    """Serializable object for instantiating a chat model backed by the OpenAI API."""
-
-    def make_model(self):
-        return OpenAIChatModel(
-            model_name=self.model_name,
-            temperature=self.temperature,
-            max_tokens=self.max_new_tokens,
-            token_param=self.token_param,
-            log_probs=self.log_probs,
-        )
-
-
-@dataclass
-class AzureModelArgs(BaseModelArgs):
-    """Serializable object for instantiating a chat model backed by Azure OpenAI."""
-
-    deployment_name: str | None = None
-
-    def make_model(self):
-        return AzureChatModel(
-            model_name=self.model_name,
-            temperature=self.temperature,
-            max_tokens=self.max_new_tokens,
-            token_param=self.token_param,
-            deployment_name=self.deployment_name,
-            log_probs=self.log_probs,
-        )
-
-
-@dataclass
-class FoundryModelArgs(BaseModelArgs):
-    """Serializable object for instantiating a chat model backed by Azure AI Foundry."""
-
-    def make_model(self):
-        return FoundryChatModel(
-            model_name=self.model_name,
-            temperature=self.temperature,
-            max_tokens=self.max_new_tokens,
-            token_param=self.token_param,
-            log_probs=self.log_probs,
-        )
-
-
-class ChatModel(AbstractChatModel):
     def __init__(
         self,
         model_name,
-        api_key=None,
-        temperature=0.5,
-        max_tokens=100,
-        token_param="max_tokens",
+        max_tokens=MAX_COMPLETION_TOKENS,
         max_retry=4,
         min_retry_wait_time=10,
-        api_key_env_var=None,
-        client_class=OpenAI,
-        client_args=None,
-        log_probs=False,
     ):
         assert max_retry > 0, "max_retry should be greater than 0"
 
         self.model_name = model_name
-        self.temperature = temperature
         self.max_tokens = max_tokens
-        self.token_param = token_param
         self.max_retry = max_retry
         self.min_retry_wait_time = min_retry_wait_time
-        self.log_probs = log_probs
 
-        # Get the API key from the environment variable if not provided
-        if api_key_env_var:
-            api_key = api_key or os.getenv(api_key_env_var)
-        self.api_key = api_key
+        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        assert endpoint, "AZURE_OPENAI_ENDPOINT has to be defined in the environment"
+        # Accept either the base (".../openai/v1") or the full completions URL,
+        # which is what the Foundry portal hands you.
+        base_url = endpoint.split("/chat/completions")[0].rstrip("/")
+        self.client = OpenAI(api_key=os.getenv("AZURE_API_KEY"), base_url=base_url)
 
-        self.client = client_class(api_key=api_key, **(client_args or {}))
-
-    def _completion_kwargs(self, messages, n_samples, temperature):
-        kwargs = {
+    def _completion_kwargs(self, messages):
+        # No `temperature`: this deployment takes only its default and 400s on
+        # anything else, including the 0.0 a benchmark run would want. No
+        # `logprobs` either -- nothing in the harness reads them back.
+        return {
             "model": self.model_name,
             "messages": messages,
-            "n": n_samples,
-            "logprobs": self.log_probs,
-            self.token_param: self.max_tokens,
+            TOKEN_PARAM: self.max_tokens,
         }
-        # Deployments that take only their default temperature are configured
-        # with no temperature, and then none is sent.
-        if temperature is not None:
-            kwargs["temperature"] = temperature
-        return kwargs
 
-    def __call__(self, messages: list[dict], n_samples: int = 1, temperature: float = None) -> dict:
+    def __call__(self, messages: list[dict]) -> dict:
         # Initialize retry tracking attributes
         self.retries = 0
         self.success = False
@@ -163,13 +98,12 @@ class ChatModel(AbstractChatModel):
 
         completion = None
         last_error = None
-        temperature = temperature if temperature is not None else self.temperature
         itr = 0
         while itr < self.max_retry:
             self.retries += 1
             try:
                 completion = self.client.chat.completions.create(
-                    **self._completion_kwargs(messages, n_samples, temperature)
+                    **self._completion_kwargs(messages)
                 )
                 self.success = True
                 break
@@ -209,9 +143,7 @@ class ChatModel(AbstractChatModel):
             "input_tokens": completion.usage.prompt_tokens,
             "completion_tokens": completion.usage.completion_tokens,
         }
-        if n_samples == 1:
-            return completion.choices[0].message, cost
-        return [c.message for c in completion.choices], cost
+        return completion.choices[0].message, cost
 
     def get_stats(self):
         return {
@@ -219,127 +151,15 @@ class ChatModel(AbstractChatModel):
         }
 
 
-class OpenAIChatModel(ChatModel):
-    def __init__(
-        self,
-        model_name,
-        api_key=None,
-        temperature=0.5,
-        max_tokens=100,
-        token_param="max_tokens",
-        max_retry=4,
-        min_retry_wait_time=10,
-        log_probs=False,
-    ):
-        super().__init__(
-            model_name=model_name,
-            api_key=api_key,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            token_param=token_param,
-            max_retry=max_retry,
-            min_retry_wait_time=min_retry_wait_time,
-            api_key_env_var="OPENAI_API_KEY",
-            client_class=OpenAI,
-            log_probs=log_probs,
-        )
-
-
-class AzureChatModel(ChatModel):
-    def __init__(
-        self,
-        model_name,
-        api_key=None,
-        deployment_name=None,
-        temperature=0.5,
-        max_tokens=100,
-        token_param="max_tokens",
-        max_retry=4,
-        min_retry_wait_time=10,
-        log_probs=False,
-    ):
-        api_key = api_key or os.getenv("AZURE_OPENAI_API_KEY")
-        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-        api_version = os.getenv("API_VERSION")
-        assert endpoint, "AZURE_OPENAI_ENDPOINT has to be defined in the environment"
-
-        super().__init__(
-            model_name=model_name,
-            api_key=api_key,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            token_param=token_param,
-            max_retry=max_retry,
-            min_retry_wait_time=min_retry_wait_time,
-            client_class=AzureOpenAI,
-            client_args={
-                "azure_deployment": deployment_name,
-                "azure_endpoint": endpoint,
-                "api_version": api_version,
-            },
-            log_probs=log_probs,
-        )
-
-
-class FoundryChatModel(ChatModel):
-    """Azure AI Foundry's `/openai/v1` API.
-
-    It speaks plain OpenAI rather than Azure's `deployments/<name>?api-version=`
-    routing, so it takes the vanilla `OpenAI` client with a `base_url` and there
-    is no deployment name to configure.
-    """
-
-    def __init__(
-        self,
-        model_name,
-        api_key=None,
-        temperature=0.5,
-        max_tokens=100,
-        token_param="max_tokens",
-        max_retry=4,
-        min_retry_wait_time=10,
-        log_probs=False,
-    ):
-        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-        assert endpoint, "AZURE_OPENAI_ENDPOINT has to be defined in the environment"
-        # Accept either the base (".../openai/v1") or the full completions URL,
-        # which is what the Foundry portal hands you.
-        base_url = endpoint.split("/chat/completions")[0].rstrip("/")
-
-        super().__init__(
-            model_name=model_name,
-            api_key=api_key or os.getenv("AZURE_API_KEY"),
-            temperature=temperature,
-            max_tokens=max_tokens,
-            token_param=token_param,
-            max_retry=max_retry,
-            min_retry_wait_time=min_retry_wait_time,
-            api_key_env_var="AZURE_OPENAI_API_KEY",
-            client_class=OpenAI,
-            client_args={"base_url": base_url},
-            log_probs=log_probs,
-        )
-
-
-MODEL_ARGS = {
-    "OpenAI": OpenAIModelArgs,
-    "Azure": AzureModelArgs,
-    "Foundry": FoundryModelArgs,
-}
-
-
 def make_chat_model(config: dict) -> AbstractChatModel:
     """Build the chat model a config block describes.
 
     Both the agent and the environment's debugger go through here so they cannot
-    drift apart. Keys the chosen `*ModelArgs` does not declare are ignored, which
-    is what lets one config shape serve all three backends.
+    drift apart. The only thing a config still chooses is which model to name and
+    how long its answer may be -- everything else about the call is fixed above,
+    so no config can describe a request the deployment will reject.
     """
-    model_type = config.get("model_type")
-    if model_type not in MODEL_ARGS:
-        raise ValueError(
-            f"Model type {model_type!r} not supported. Choose from {sorted(MODEL_ARGS)}."
-        )
-    args_class = MODEL_ARGS[model_type]
-    declared = {f.name for f in dataclasses.fields(args_class)}
-    return args_class(**{k: v for k, v in config.items() if k in declared}).make_model()
+    return ChatModel(
+        model_name=config["model_name"],
+        max_tokens=config.get("max_new_tokens") or MAX_COMPLETION_TOKENS,
+    )
