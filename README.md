@@ -242,6 +242,12 @@ Things worth knowing before the first run:
   `/data` onto a JRE base; nothing is uploaded from your checkout to build it.
 - **BioDSBench study data is fetched inside each sandbox** (~160 MB per sandbox), because
   it is gitignored and so not in the clone.
+- **Losing the driver does not lose the run.** Each shard is started detached, so it keeps
+  going and keeps sending traces to Laminar; what stops is the download and the cleanup.
+  `scripts/daytona_collect.py` is that tail on its own — it adopts the sandboxes a run left
+  behind (matched on the `medagentgym` label, so nothing else on the account is touched),
+  waits for each to finish, unpacks its `workdir/` and deletes it. Pass `--extend-ttl` when
+  adopting: a sandbox's TTL runs from creation, and the run has already spent some of it.
 
 ## Results
 
