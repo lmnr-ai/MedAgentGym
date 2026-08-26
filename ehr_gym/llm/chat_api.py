@@ -1,19 +1,14 @@
 import dataclasses
 import logging
 import os
-import re
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import openai
 from openai import AzureOpenAI, OpenAI
 
 logger = logging.getLogger(__name__)
-
-# Codes the OpenAI-shaped APIs use to say "that parameter is not for this model".
-_PARAM_REJECTION_CODES = ("unsupported_parameter", "unsupported_value")
-_REPLACEMENT_RE = re.compile(r"use '(\w+)' instead", re.I)
 
 
 def make_system_message(content: str) -> dict:
@@ -32,55 +27,6 @@ class RetryError(RuntimeError):
     """Raised when the chat API could not be reached within the retry budget."""
 
 
-@dataclass
-class ParamQuirks:
-    """What a deployment has told us it will not accept.
-
-    Deployments disagree about sampling parameters -- the GPT-5 generation
-    rejects any `temperature` other than the default and renamed `max_tokens` to
-    `max_completion_tokens`. Sniffing model names to guess this ages badly, so we
-    send the full set once, read the 400 back, and remember it for the rest of
-    the process instead.
-    """
-
-    drop: set[str] = field(default_factory=set)
-    rename: dict[str, str] = field(default_factory=dict)
-
-    def apply(self, kwargs: dict) -> dict:
-        for old, new in self.rename.items():
-            if old in kwargs:
-                kwargs[new] = kwargs.pop(old)
-        for name in self.drop:
-            kwargs.pop(name, None)
-        return kwargs
-
-    def learn(self, error: openai.BadRequestError) -> bool:
-        """Record the rejection. False if it taught us nothing new.
-
-        The caller retries only while this returns True, so every True has to add
-        information -- otherwise a deployment that keeps rejecting the same
-        parameter would spin forever.
-        """
-        body = error.body if isinstance(error.body, dict) else {}
-        param = body.get("param")
-        if body.get("code") not in _PARAM_REJECTION_CODES or not param:
-            return False
-        replacement = _REPLACEMENT_RE.search(body.get("message") or "")
-        if replacement:
-            if self.rename.get(param) == replacement.group(1):
-                return False
-            self.rename[param] = replacement.group(1)
-        else:
-            if param in self.drop:
-                return False
-            self.drop.add(param)
-        return True
-
-
-# Keyed by model name so each worker process pays the discovery cost once.
-_QUIRKS: dict[str, ParamQuirks] = {}
-
-
 class AbstractChatModel(ABC):
     @abstractmethod
     def __call__(self, messages: list[dict]) -> dict:
@@ -92,13 +38,24 @@ class AbstractChatModel(ABC):
 
 @dataclass
 class BaseModelArgs(ABC):
-    """Base class for all model arguments"""
+    """Base class for all model arguments.
+
+    Deployments disagree about sampling parameters: the GPT-5 generation renamed
+    `max_tokens` to `max_completion_tokens` and accepts no `temperature` other
+    than its default. Which shape a deployment wants is declared here -- and so
+    in the config -- rather than discovered from the 400s it sends back, because
+    discovery costs two rejected calls in *every* worker process, and every one
+    of those is a step the agent did not get to take.
+    """
 
     model_name: str
     max_total_tokens: int | None = None
     max_input_tokens: int | None = None
     max_new_tokens: int | None = None
-    temperature: float = 0.6
+    # `None` means "send no temperature at all", not "send zero".
+    temperature: float | None = 0.6
+    # The name this deployment gives the output-length ceiling.
+    token_param: str = "max_tokens"
     vision_support: bool = False
     log_probs: bool = False
 
@@ -116,6 +73,7 @@ class OpenAIModelArgs(BaseModelArgs):
             model_name=self.model_name,
             temperature=self.temperature,
             max_tokens=self.max_new_tokens,
+            token_param=self.token_param,
             log_probs=self.log_probs,
         )
 
@@ -131,6 +89,7 @@ class AzureModelArgs(BaseModelArgs):
             model_name=self.model_name,
             temperature=self.temperature,
             max_tokens=self.max_new_tokens,
+            token_param=self.token_param,
             deployment_name=self.deployment_name,
             log_probs=self.log_probs,
         )
@@ -145,6 +104,7 @@ class FoundryModelArgs(BaseModelArgs):
             model_name=self.model_name,
             temperature=self.temperature,
             max_tokens=self.max_new_tokens,
+            token_param=self.token_param,
             log_probs=self.log_probs,
         )
 
@@ -156,6 +116,7 @@ class ChatModel(AbstractChatModel):
         api_key=None,
         temperature=0.5,
         max_tokens=100,
+        token_param="max_tokens",
         max_retry=4,
         min_retry_wait_time=10,
         api_key_env_var=None,
@@ -168,6 +129,7 @@ class ChatModel(AbstractChatModel):
         self.model_name = model_name
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.token_param = token_param
         self.max_retry = max_retry
         self.min_retry_wait_time = min_retry_wait_time
         self.log_probs = log_probs
@@ -180,14 +142,18 @@ class ChatModel(AbstractChatModel):
         self.client = client_class(api_key=api_key, **(client_args or {}))
 
     def _completion_kwargs(self, messages, n_samples, temperature):
-        return {
+        kwargs = {
             "model": self.model_name,
             "messages": messages,
             "n": n_samples,
             "logprobs": self.log_probs,
-            "temperature": temperature,
-            "max_tokens": self.max_tokens,
+            self.token_param: self.max_tokens,
         }
+        # Deployments that take only their default temperature are configured
+        # with no temperature, and then none is sent.
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        return kwargs
 
     def __call__(self, messages: list[dict], n_samples: int = 1, temperature: float = None) -> dict:
         # Initialize retry tracking attributes
@@ -198,23 +164,22 @@ class ChatModel(AbstractChatModel):
         completion = None
         last_error = None
         temperature = temperature if temperature is not None else self.temperature
-        quirks = _QUIRKS.setdefault(self.model_name, ParamQuirks())
         itr = 0
         while itr < self.max_retry:
             self.retries += 1
             try:
                 completion = self.client.chat.completions.create(
-                    **quirks.apply(self._completion_kwargs(messages, n_samples, temperature))
+                    **self._completion_kwargs(messages, n_samples, temperature)
                 )
                 self.success = True
                 break
+            except openai.BadRequestError as e:
+                # The request itself is wrong -- a parameter this deployment does
+                # not take, or a conversation past its context window. Waiting
+                # will not change that, so surface it now instead of spending the
+                # backoff budget reserved for rate limits and outages.
+                raise RetryError(f"{self.model_name} rejected the request: {e}") from e
             except openai.OpenAIError as e:
-                if isinstance(e, openai.BadRequestError) and quirks.learn(e):
-                    # We sent a parameter this deployment does not take. That is
-                    # our bug, not a service failure, so retry at once and do not
-                    # spend the budget reserved for rate limits and outages.
-                    logger.info(f"{self.model_name} rejected a parameter, retrying without it: {e}")
-                    continue
                 itr += 1
                 last_error = e
                 self.error_types.append(type(e).__name__)
@@ -261,6 +226,7 @@ class OpenAIChatModel(ChatModel):
         api_key=None,
         temperature=0.5,
         max_tokens=100,
+        token_param="max_tokens",
         max_retry=4,
         min_retry_wait_time=10,
         log_probs=False,
@@ -270,6 +236,7 @@ class OpenAIChatModel(ChatModel):
             api_key=api_key,
             temperature=temperature,
             max_tokens=max_tokens,
+            token_param=token_param,
             max_retry=max_retry,
             min_retry_wait_time=min_retry_wait_time,
             api_key_env_var="OPENAI_API_KEY",
@@ -286,6 +253,7 @@ class AzureChatModel(ChatModel):
         deployment_name=None,
         temperature=0.5,
         max_tokens=100,
+        token_param="max_tokens",
         max_retry=4,
         min_retry_wait_time=10,
         log_probs=False,
@@ -300,6 +268,7 @@ class AzureChatModel(ChatModel):
             api_key=api_key,
             temperature=temperature,
             max_tokens=max_tokens,
+            token_param=token_param,
             max_retry=max_retry,
             min_retry_wait_time=min_retry_wait_time,
             client_class=AzureOpenAI,
@@ -326,6 +295,7 @@ class FoundryChatModel(ChatModel):
         api_key=None,
         temperature=0.5,
         max_tokens=100,
+        token_param="max_tokens",
         max_retry=4,
         min_retry_wait_time=10,
         log_probs=False,
@@ -341,6 +311,7 @@ class FoundryChatModel(ChatModel):
             api_key=api_key or os.getenv("AZURE_API_KEY"),
             temperature=temperature,
             max_tokens=max_tokens,
+            token_param=token_param,
             max_retry=max_retry,
             min_retry_wait_time=min_retry_wait_time,
             api_key_env_var="AZURE_OPENAI_API_KEY",

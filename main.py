@@ -70,8 +70,20 @@ def convert_config_to_args(config, args):
 
 
 def set_environment_variables(credentials_path):
-    for key, value in toml.load(credentials_path).items():
+    """Make the credentials file the only source of credentials for this run.
+
+    The machine this runs on may already carry an ambient `LMNR_PROJECT_API_KEY`
+    belonging to something else entirely. Inheriting it is worse than having no
+    key at all -- the run looks traced, and a few hundred trajectories land in a
+    project nobody is watching -- so a Laminar key the file does not name is
+    removed rather than left in place.
+    """
+    credentials = toml.load(credentials_path)
+    for key, value in credentials.items():
         os.environ[key] = value
+    for key in ("LMNR_PROJECT_API_KEY", "LMNR_BASE_URL"):
+        if key not in credentials:
+            os.environ.pop(key, None)
 
 
 def get_task_class(task):

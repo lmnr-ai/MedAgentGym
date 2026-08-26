@@ -39,6 +39,10 @@ def initialize() -> bool:
     if not api_key:
         logger.info("LMNR_PROJECT_API_KEY is not set; running without tracing.")
         return False
+    # The key decides which project a whole run lands in and nothing downstream
+    # will tell you it was the wrong one, so name it here. Eight characters is
+    # enough to tell two keys apart and not enough to use.
+    logger.info(f"Tracing to Laminar with project key {api_key[:8]}...")
     Laminar.initialize(project_api_key=api_key, base_url=os.getenv("LMNR_BASE_URL") or None)
     return True
 

@@ -71,13 +71,15 @@ Only four datasets remain: `biocoder`, `biodsbench`, `medagentbench`, `medcalcbe
 
 ## Calling models
 
-- **Do not sniff model names to decide which sampling parameters to send.** `chat_api.py`
-  sends everything, parses the 400 (`unsupported_parameter` / `unsupported_value`) and
-  retries without the offending parameter, caching the lesson per model name in `_QUIRKS`.
-  Quirk retries deliberately do *not* consume `max_retry`, which is reserved for 429s and
-  outages. gpt-5.6-luna needs both branches: `max_tokens` → `max_completion_tokens`
-  (rename, taken from the error message) and `temperature` (dropped outright — it only
-  accepts the default 1).
+- **Which sampling parameters a deployment takes is declared in its config, not discovered.**
+  `temperature: null` means "send no temperature"; `token_param` names the output ceiling.
+  gpt-5.6-luna needs both (`temperature: null`, `token_param: max_completion_tokens`) — it
+  only accepts the default temperature and renamed `max_tokens`. Do not go back to sniffing
+  model names *or* to learning from the 400s: discovery cost two rejected calls in every
+  joblib worker process, and a worker is created per task.
+- A `BadRequestError` is raised immediately rather than retried. It means the request is
+  wrong — bad parameter, or a conversation past the context window — and no amount of
+  backoff fixes that; `max_retry` is reserved for 429s and outages.
 - **Reasoning tokens count against `max_completion_tokens`.** A gpt-5.6-luna call with a
   600-token ceiling returns `finish_reason: "length"`, `reasoning_tokens: 600` and *empty*
   content. In the harness that surfaces as "the model cannot produce valid JSON", not as a
@@ -110,9 +112,19 @@ schema shared across Laminar's trajectory datasets. Two traps:
   called from the `finally` of `run_single_rollout` and not at span start — `num_steps` and
   the verdict are not known until the rollout ends, and a crashed one still needs metadata.
 
+- **An ambient `LMNR_PROJECT_API_KEY` in the shell will quietly capture a run.** Laminar
+  keys carry the project, so a key inherited from the surrounding machine sends every
+  trajectory to a project nobody is watching, and nothing in the run says so.
+  `set_environment_variables()` therefore treats `credentials.toml` as exhaustive: a Laminar
+  key it does not name is *removed* from the environment rather than left in place. Which
+  key is in use is logged (first eight characters) at the top of every worker.
+
 To confirm delivery, read the spans back with `LaminarClient(project_api_key=...).sql.query`
 — e.g. `SELECT name, span_id, parent_span_id, path FROM spans WHERE trace_id = '...'`.
-Root spans have `parent_span_id = '00000000-0000-0000-0000-000000000000'`. This needs a
+Root spans have `parent_span_id = '00000000-0000-0000-0000-000000000000'`. There is no
+`metadata` column — selecting one is a ClickHouse `UNKNOWN_IDENTIFIER` 400; the trajectory
+metadata is inside `attributes`, a JSON string, under `lmnr.association.properties.metadata.*`,
+so read the whole column and unpack it client-side. This needs a
 key with **read** scope; a write-only key 404s on `/v1/sql/query` and
 `/v1/projects/current`, which looks exactly like the routes not existing. The check that
 works with any key is differential: a bogus key logs `Failed to export traces to
