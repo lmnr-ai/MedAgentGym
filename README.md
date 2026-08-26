@@ -204,6 +204,7 @@ then download the `workdir/` tree and delete the sandbox.
 | Flag | Meaning |
 | --- | --- |
 | `--sandboxes N` | how many sandboxes to shard the indices across (round-robin) |
+| `--max-concurrent N` | shards in flight at once (default: all of them) |
 | `--n-jobs N` | joblib workers *inside* each sandbox |
 | `--ref` | branch, tag or commit to clone (default `main`) — this is what pins the run |
 | `--indices-path` | run a fixed index list, e.g. `data/smoke_indices.json` |
@@ -229,7 +230,8 @@ Things worth knowing before the first run:
   what they wrote, so a shared server would let one shard's writes show up in another's
   reads. `--sandboxes` is therefore also the isolation knob: `--sandboxes 60` on the test
   split is one clean server per task. Each one costs ~2 minutes of startup and 8 GB of RAM,
-  and is torn down with its worker.
+  and is torn down with its worker, so pair a high `--sandboxes` with `--max-concurrent`:
+  isolation is the shard count, cost is how many of them exist at the same time.
 - **The FHIR sandboxes are public** for the life of the run, since the workers reach them
   over their preview URLs and hold no Daytona token. They serve only MedAgentBench's
   synthetic patients, but they are world-reachable while the run lasts.

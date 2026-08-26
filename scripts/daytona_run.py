@@ -126,6 +126,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-idx", type=int, default=0)
     parser.add_argument("--end-idx", type=int, default=-1, help="-1 means all of data/metadata.json")
     parser.add_argument("--sandboxes", type=int, default=4, help="how many sandboxes to shard across")
+    parser.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=0,
+        help="shards in flight at once (0, the default, means all of them)",
+    )
     parser.add_argument("--n-jobs", type=int, default=1, help="joblib workers *inside* each sandbox")
     parser.add_argument("--num-rollouts", type=int, default=1)
     parser.add_argument("--num-steps", type=int)
@@ -579,7 +585,14 @@ def main() -> None:
     image = None if args.snapshot else Image.from_dockerfile(REPO_DIR / "Dockerfile.daytona")
 
     started = time.time()
-    with ThreadPoolExecutor(max_workers=len(shards)) as pool:
+    # Sharding is the isolation knob, so a clean-state run wants *many* shards --
+    # one per task, in the limit. Wanting them all in flight at once is a
+    # different thing: each shard holds a sandbox, and with `--with-fhir` a
+    # second, 8 GiB one, which is how a run meets the account's quota rather than
+    # its deadline. Isolation is the shard count; cost is the concurrency.
+    in_flight = min(args.max_concurrent or len(shards), len(shards))
+    print(f"at most {in_flight} shards in flight at a time")
+    with ThreadPoolExecutor(max_workers=in_flight) as pool:
         results = list(
             pool.map(
                 lambda pair: run_shard(client, image, args, creds, pair[1], f"shard-{pair[0]}"),
