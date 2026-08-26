@@ -187,7 +187,12 @@ flags. The non-obvious parts:
   `http://localhost:8080/fhir/` (`bash data/medagentbench/start_eval_docker.sh`), or
   wherever `MEDAGENTBENCH_FHIR_URL` points. 54/60
   test rows have an empty `sol` and are graded by programmatic `task1..task10` graders that
-  query the server. Tasks 3/5/8/9/10 mutate server state, so restart between full runs.
+  query the server. Tasks 3/5/8/9/10 mutate server state, so each shard gets its own server
+  (`--with-fhir`) rather than restarting a shared one. `task3` asserted a hardcoded
+  `Patient/S2380121` — `task3_1`'s MRN and nobody else's — so its other 28 datapoints were
+  unwinnable; it now compares against `case_data['eval_MRN']` like every other grader here.
+  Worth re-checking that pattern before trusting a 0 on this dataset: the graders are string
+  containment over `str(results)`, so a bad constant looks exactly like a bad agent.
 - **MedCalcBench** (1047 test, no train split) — self-contained. 55 of the 57 calculators
   produce a number graded against `[Lower Limit, Upper Limit]`; the other two produce a
   date or a gestational age, and for those the limits are just the answer repeated.
