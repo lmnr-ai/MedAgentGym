@@ -362,7 +362,11 @@ class MedAgentBenchAnswerEvaluator():
             assert "effectiveDateTime" in str(results) and "2023-11-13T10:15:00+00:00" in str(results)
             assert "status" in str(results) and "final" in str(results)
             assert "valueString" in str(results) and "118/77 mmHg" in str(results)
-            assert "reference" in str(results) and "Patient/S2380121" in str(results)
+            # Upstream hardcodes "Patient/S2380121" here, which is the eval_MRN of
+            # task3_1 and of no other case, so every other task3 datapoint fails no
+            # matter what the agent writes. Every other task in this file compares
+            # against case_data['eval_MRN'].
+            assert "reference" in str(results) and f"Patient/{case_data['eval_MRN']}" in str(results)
         except Exception as e:
             print(e, flush=True)
             return False

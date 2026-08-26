@@ -224,14 +224,24 @@ def run_detached(sandbox, argv: list[str], timeout: int, label: str) -> int:
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(30)
-        probe = sandbox.process.exec("cat /tmp/exit_code 2>/dev/null", cwd=REMOTE_REPO, timeout=60)
-        code = (probe.result or "").strip()
-        if code:
-            return int(code)
-        written = sandbox.process.exec(
-            "ls workdir/*/*/*/history_*.json 2>/dev/null | wc -l", cwd=REMOTE_REPO, timeout=60
-        )
-        print(f"[{label}] {(written.result or '0').strip()} trajectories written")
+        # A probe that fails is a reason to poll again, not to give up on the
+        # shard: the job runs detached and does not care whether anyone is
+        # watching, while `exec` against a busy daemon returns "command
+        # execution timeout" often enough to sink a multi-hour run over a `cat`.
+        # `deadline` is what ends this loop.
+        try:
+            probe = sandbox.process.exec(
+                "cat /tmp/exit_code 2>/dev/null", cwd=REMOTE_REPO, timeout=60
+            )
+            code = (probe.result or "").strip()
+            if code:
+                return int(code)
+            written = sandbox.process.exec(
+                "ls workdir/*/*/*/history_*.json 2>/dev/null | wc -l", cwd=REMOTE_REPO, timeout=60
+            )
+            print(f"[{label}] {(written.result or '0').strip()} trajectories written")
+        except DaytonaError as e:
+            print(f"[{label}] probe failed, still waiting: {e}")
     raise RuntimeError(f"[{label}] shard did not finish within {timeout}s")
 
 
