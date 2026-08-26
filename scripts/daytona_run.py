@@ -78,6 +78,15 @@ FHIR_PORT = 8080
 # to the other.
 STARTED_FILE = "/tmp/run.started"
 EXIT_CODE_FILE = "/tmp/exit_code"
+LOG_FILE = "/tmp/run.log"
+# How long a shard may say nothing at all before it is presumed dead and started
+# again. A shard is killed without warning often enough to plan for -- the
+# sandbox outlives the process, so the symptom is a log that simply stops -- and
+# without this the poll loop waits out the whole `--timeout` for an exit code
+# that is never coming. Generous, because it is measured against the log rather
+# than against progress: one task can take a while, but a live shard writes a
+# line per LLM call and per code validation throughout.
+STALL_TIMEOUT = 20 * 60
 # What `--ref` has to look like to be treated as a commit rather than a branch.
 # `git.clone` takes the two on different keyword arguments and the server clones
 # with `--branch`, which does not accept a SHA -- so a pinned commit passed as a
@@ -250,6 +259,35 @@ def settled_shard_state(sandbox, label: str, attempts: int = 6, delay: int = 15)
     return "unknown"
 
 
+def shard_progress(sandbox) -> tuple[int, int] | None:
+    """`(trajectories written, log mtime)`, or `None` if the sandbox would not say.
+
+    Two numbers rather than one because they answer different questions: the
+    count is what a watching human wants, and the mtime is what tells a dead
+    shard from a slow one -- a task that takes twenty minutes still writes a log
+    line every few seconds while it does.
+    """
+    try:
+        probe = sandbox.process.exec(
+            # `find`, not a glob: trajectories land five levels down, under
+            # `workdir/<model>/<task>/<tag>/<mode>/`, and a glob written to the
+            # wrong depth silently reports every healthy shard as zero.
+            "find workdir -name 'history_*.json' 2>/dev/null | wc -l; "
+            f"stat -c %Y {LOG_FILE} 2>/dev/null || echo 0",
+            cwd=REMOTE_REPO,
+            timeout=60,
+        )
+    except DaytonaError:
+        return None
+    fields = (probe.result or "").split()
+    if len(fields) < 2:
+        return None
+    try:
+        return int(fields[0]), int(fields[1])
+    except ValueError:
+        return None
+
+
 def launch(sandbox, inner: str, label: str, attempts: int = 5) -> bool:
     """Start the shard in the background, retrying a flaky `exec`.
 
@@ -317,6 +355,9 @@ def run_detached(sandbox, argv: list[str], timeout: int, label: str) -> int:
             raise RuntimeError(f"[{label}] the shard never started")
         print(f"[{label}] shard state is {state}, polling anyway")
     deadline = time.time() + timeout
+    last_progress = None
+    quiet_since = time.time()
+    restarts = 0
     while time.time() < deadline:
         time.sleep(30)
         # A probe that fails is a reason to poll again, not to give up on the
@@ -331,12 +372,37 @@ def run_detached(sandbox, argv: list[str], timeout: int, label: str) -> int:
             code = (probe.result or "").strip()
             if code:
                 return int(code)
-            written = sandbox.process.exec(
-                "ls workdir/*/*/*/history_*.json 2>/dev/null | wc -l", cwd=REMOTE_REPO, timeout=60
-            )
-            print(f"[{label}] {(written.result or '0').strip()} trajectories written")
         except DaytonaError as e:
             print(f"[{label}] probe failed, still waiting: {e}")
+            continue
+
+        progress = shard_progress(sandbox)
+        if progress is None:
+            # A silent sandbox is not a stopped shard, and the mtime that would
+            # prove otherwise is exactly what could not be read. Wait.
+            continue
+        if progress != last_progress:
+            last_progress = progress
+            quiet_since = time.time()
+            print(f"[{label}] {progress[0]} trajectories written")
+            continue
+        if time.time() - quiet_since < STALL_TIMEOUT:
+            continue
+
+        # The log has not been touched in `STALL_TIMEOUT` and no exit code was
+        # ever written, so the process is gone rather than busy -- the sandbox
+        # outlives it, which is why nothing else here notices. Starting it again
+        # is safe *because* `main.py` skips a task whose history file is already
+        # on disk, so a restart resumes where the last one stopped instead of
+        # redoing it. Without this the loop would wait out the full `--timeout`
+        # for an exit code that is never coming.
+        if restarts >= 5:
+            raise RuntimeError(f"[{label}] shard died {restarts} times; giving up")
+        restarts += 1
+        print(f"[{label}] silent for {STALL_TIMEOUT}s, restarting shard ({restarts}/5)")
+        launch(sandbox, inner, label)
+        last_progress = None
+        quiet_since = time.time()
     raise RuntimeError(f"[{label}] shard did not finish within {timeout}s")
 
 
