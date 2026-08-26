@@ -18,41 +18,235 @@ This is the official repository for the paper: "MedAgentGym: Training LLM Agents
   <img src="./assets/figure1.png" width="100%" alt="teaser">
 </p>
 
-### Dataset Access
+### Datasets
 
-#### EHR Data Access (<font color=#FF000>Update on July 18th, 2025</font>)
-MedAgentGym has been carefully curated in strict accordance with ethical standards, utilizing datasets that are either publicly available or that incorporate rigorous privacy protection and anonymization measures. Table 7 in the Appendix details the specific access requirements for each of the 12 datasets included in MedAgentGym. Researchers seeking access to preprocessed tasks and data files must first obtain and submit all necessary data usage agreements. Access Policy: Only credentialed users who have signed the Data Use Agreement (DUA) are permitted to access these files. 
-```
-License (for files): PhysioNet Credentialed Health Data License 1.5.0
-Data Use Agreement: PhysioNet Credentialed Health Data Use Agreement 1.5.0
-Required Training: CITI Data or Specimens Only Research.
-```
-Please note, this current version excludes the MIMIC-related (MIMIC-III, eICU, TREQS) and EHRSHOT dataset. Access to data involving [MIMIC-III](https://physionet.org/content/mimiciii/1.4/), [eICU](https://eicu-crd.mit.edu), and [EHRSHOT](https://redivis.com/datasets/53gc-8rhx41kgt) tasks requires additional approval from PhysioNet and Stanford University. Researchers seeking for any additional guidance on full access to preprocessed data can send an email to `medagentgym@gmail.com`, using the subject line “MedAgentGym Preprocessed Data Access".
+> **Fork note.** This fork intentionally ships **only the four datasets that require no
+> credentialed data-use agreement**. Everything tied to restricted EHR corpora
+> (MIMIC-III, eICU, TREQS, EHRShot, EHRCon, EHR-SeqSQL, MIMIC-Extract) and to nPowerAI
+> has been removed from the task modules, configs, and `./data/`. Do not re-add them.
 
-#### Tasks Definition and Access
-This repository contains basic task files `train_tasks.jsonl` and `test_tasks.jsonl`, each including the task ID, task description, question, and corresponding ground truth answer.
-After completing the previous step and obtaining approval for access, applicants will receive a script (`download_data.py`) to download the entire preprocessed dataset from a private repository. This script will automatically download all datasets into the `./data/` directory. The downloaded datasets should be structured as `./data/biocoder/*`. Detailed descriptions of the datasets utilized in this paper are provided below:
+| Dataset | `--task` | Train | Test | External prerequisite |
+| --- | --- | --- | --- | --- |
+| BioCoder | `biocoder` | 496 | 149 | the `tasks` extra (reference programs are executed) |
+| BioDSBench | `biodsbench` | 42 | 43 | `scripts/fetch_biodsbench_data.py` (~160 MB of study data) |
+| MedAgentBench | `medagentbench` | 240 | 60 | HAPI FHIR server on `http://localhost:8080/fhir/` |
+| MedCalcBench | `medcalcbench` | — | 1047 | none |
 
-<p align="center">
-  <img src="./assets/figure3.png" width="100%" alt="teaser">
-</p>
+Task files (`train_tasks.jsonl` / `test_tasks.jsonl`) hold the task id, description,
+question, and ground-truth answer for each datapoint. `data/metadata.json` holds the
+per-split datapoint counts and is what `--end_idx -1` resolves against.
 
+Every dataset here is graded by executing code; there is no LLM-as-a-judge anywhere.
 
-### Build Docker Container
-Since our dataset relies on a Docker environment for isolated coding and execution, you may first build the Docker container. Please execute the following command:
+Per-dataset notes:
+
+- **MedAgentBench** grades against a live FHIR server: `bash data/medagentbench/start_eval_docker.sh`
+  brings up `jyxsu6/medagentbench` on port 8080. Tasks 3/5/8/9/10 write to it, so restart
+  the server between full runs to get a clean state.
+- **BioCoder** derives its ground truth at task-setup time by *executing the reference
+  program* and capturing stdout, so a task is only gradable if its reference runs. The
+  counts above are what `scripts/filter_biocoder.py` verified against the `tasks` extra;
+  re-run it whenever that extra changes.
+- **BioDSBench** ships task definitions only. Run `scripts/fetch_biodsbench_data.py` once
+  to download the eleven cBioPortal studies the tasks read; the output is gitignored.
+- **MedCalcBench** has no train split in this repo; only `test_tasks.jsonl` (1047 rows).
+
+### What this fork changes
+
+- Only the four unrestricted datasets remain; all restricted task modules, configs and
+  data directories are gone.
+- Packaging moved from `requirements.txt` to `uv` (`pyproject.toml` + `uv.lock`).
+- The Docker image is plain `python:3.11-slim` instead of `nvidia/cuda:*-devel`, and
+  `torch` is gone — nothing here runs a local model.
+- `rollout.py` was folded into `main.py` as `--num_rollouts` / `--rollout_indices_path`.
+- Ray, vLLM, `request_info`, and the unused `langchain` / `transformers` / WolframAlpha
+  code paths were removed. Parallelism is joblib-only.
+- Upstream spliced the agent's code into a task template with a plain `str.replace`,
+  which dropped the marker's indentation and quietly corrupted every submission made
+  inside a class or function body. Substitution now lives in
+  `ehr_gym/env/task/substitution.py` and re-indents the block.
+- Ungradable datapoints were removed (`scripts/filter_*.py`): BioCoder references that
+  crash, print nothing, or print something different on each run, and BioDSBench tasks
+  whose own reference fails their assertions.
+- MedCalcBench's grader compared everything as a float, so the 60 date and
+  gestational-age answers could never pass. It now parses each answer shape.
+- The grader's verdict never reached the agent: `validate()` computed "the answer is
+  incorrect" and `env.step` threw it away, so a model that ran a working program with a
+  wrong answer saw only its own stdout and resubmitted the same code until the step
+  budget ran out. The verdict is now appended to the observation.
+- Grading used stdout **and** stderr, so a submission that merely emitted a
+  `UserWarning` scored 0. Rewards now come from stdout alone, which is what
+  `scripts/filter_biocoder.py` picked the keep set with; the agent is still shown stderr.
+- Every rollout is traced to [Laminar](https://www.lmnr.ai/) — see *Tracing* below.
+- `scripts/daytona_run.py` runs a sharded experiment on Daytona sandboxes, which gives
+  agent-generated code a throwaway machine and removes the Docker prerequisite for
+  MedAgentBench — see *Running on Daytona* below.
+
+### Setup
+
+Dependencies are managed with [uv](https://docs.astral.sh/uv/). The `tasks` extra holds
+the scientific packages that the *agent-generated* code needs; it is installed into the
+same environment because `validate_code` executes that code with the venv interpreter.
+
 ```bash
-docker buildx build -t ehr_gym:latest .
+uv sync --extra tasks
+cp credentials.example.toml credentials.toml   # then fill in your Azure AI Foundry keys
+uv run python scripts/fetch_biodsbench_data.py # only needed for --task biodsbench
 ```
-Alternatively, you can run the prepared script directly:
+
+### Maintenance scripts
+
+| Script | Purpose |
+| --- | --- |
+| `scripts/fetch_biodsbench_data.py` | download + convert the cBioPortal studies BioDSBench reads |
+| `scripts/filter_biocoder.py` | drop BioCoder rows whose reference program is not gradable |
+| `scripts/filter_biodsbench.py` | drop BioDSBench rows whose reference fails its own assertions |
+
+Both filters rewrite the task files in place and update `data/metadata.json`; pass
+`--dry-run` to see the drop report without touching anything.
+
+### Run an experiment
+
+```bash
+uv run python main.py --config_path configs/gpt_5_6_luna/exp-gpt_5_6_luna-biocoder.yaml --n_jobs 5
+```
+
+Useful flags:
+
+| Flag | Meaning |
+| --- | --- |
+| `--n_jobs N` | joblib process-level parallelism (default 1) |
+| `--num_rollouts K` | sample K trajectories per task; writes `history_<idx>_<rollout>.json` |
+| `--mode train\|test` | which split to run (default `test`) |
+| `--start_idx` / `--end_idx` | index range; `--end_idx -1` means "all", read from `data/metadata.json` |
+| `--rollout_indices_path` | JSON of `{task: {mode: [idx, ...]}}`, e.g. `data/rollout_indices.json` |
+
+Trajectories land in `<work_dir>/<task>/<result_dir_tag>/<mode>/history_*.json`. Existing
+files are skipped, so a run can be resumed by re-invoking the same command.
+
+`data/smoke_indices.json` holds ten indices per dataset, for a cheap end-to-end check:
+
+```bash
+uv run python main.py --config_path configs/gpt_5_6_luna/exp-gpt_5_6_luna-medcalcbench.yaml \
+  --rollout_indices_path data/smoke_indices.json --n_jobs 1
+```
+
+### Models
+
+One deployment: `gpt-5.6-luna` on Azure AI Foundry's OpenAI-compatible `/openai/v1`,
+reached with `AZURE_OPENAI_ENDPOINT` and `AZURE_API_KEY`. The call shape is hard-coded in
+`ehr_gym/llm/chat_api.py` rather than assembled from the config, so a config cannot
+describe a request the deployment will reject:
+
+- no `temperature` — this generation takes only its default and 400s on any other value,
+  including the `0.0` a benchmark run would otherwise want;
+- `max_completion_tokens`, not `max_tokens`, which this generation 400s on by name.
+
+Each of those was a rejected call per worker process before the agent's first real turn.
+A config chooses only `model_name` and `max_new_tokens`.
+
+Give `max_new_tokens` plenty of room. Reasoning tokens are billed against the same ceiling
+as the answer, so a budget that looks generous can be spent entirely on thinking and return
+truncated JSON — which reaches the parser as a formatting failure. The configs use 32768.
+
+### Tracing
+
+Set `LMNR_PROJECT_API_KEY` (in `credentials.toml`) and every rollout becomes a Laminar
+trace; leave it unset and the SDK is never initialized, so nothing else changes.
+
+```
+<task>[<mode>/<idx>]          root span, one per trajectory, session = result_dir_tag
+  openai.chat                 from the SDK's OpenAI auto-instrumentation
+  env.validate_code           the action's arguments, its reward, and the feedback
+  openai.chat                 the next turn, and so on
+```
+
+The two span kinds are deliberately siblings rather than nested under per-step wrappers,
+so a trajectory reads as one flat alternating sequence of "what the model said" and "what
+the environment did".
+
+Rollouts run in joblib worker *processes*, which do not inherit the parent's tracer
+provider, so `ehr_gym/tracing.py` initializes inside the worker and flushes after every
+rollout — a worker can be torn down without running interpreter shutdown hooks.
+
+### Running in Docker
+
+The image is CPU-only — this harness only calls hosted LLM APIs, so there is no CUDA
+runtime and no `torch`.
+
 ```bash
 bash build_docker.sh
+TASK_NAME=biocoder N_JOBS=5 bash run_docker.sh
 ```
 
-### Run Experiment
-Prepare your experiment commands in the `entrypoint.sh` file. For instance, to run experiments on the Biocoder task using the GPT-4.1-mini model, execute the following command for parallel execution with 5 threads:
+### Running on Daytona
+
+`scripts/daytona_run.py` shards a run across [Daytona](https://www.daytona.io/) sandboxes.
+Worth doing for three reasons: agent-generated code gets a throwaway machine instead of
+your checkout, MedAgentBench's FHIR server becomes a sandbox instead of a `docker run`,
+and the work is spread over `--sandboxes × --n-jobs` concurrent rollouts.
+
 ```bash
-python3 /home/main.py --config /home/configs/gpt_4_1_mini/exp-gpt_4_1_mini-biocoder.yaml --async_run --parallel_backend joblib --n_jobs 5
+uv sync --extra daytona
+export DAYTONA_API_KEY=...
+
+uv run python scripts/daytona_run.py --task biocoder --sandboxes 4 --n-jobs 2
 ```
+
+What it does per sandbox: build (or reuse) the image from `Dockerfile.daytona`, `git clone`
+the repo at `--ref`, `uv sync --locked --extra tasks`, upload your `credentials.toml` and a
+`shard.json` of that sandbox's task indices, run `main.py --rollout_indices_path shard.json`,
+then download the `workdir/` tree and delete the sandbox.
+
+| Flag | Meaning |
+| --- | --- |
+| `--sandboxes N` | how many sandboxes to shard the indices across (round-robin) |
+| `--max-concurrent N` | shards in flight at once (default: all of them) |
+| `--n-jobs N` | joblib workers *inside* each sandbox |
+| `--ref` | branch, tag or commit to clone (default `main`) — this is what pins the run |
+| `--indices-path` | run a fixed index list, e.g. `data/smoke_indices.json` |
+| `--snapshot NAME` | reuse a prebuilt Daytona snapshot instead of building the Dockerfile |
+| `--with-fhir` | give each shard its own MedAgentBench FHIR server sandbox |
+| `--keep-sandboxes` | leave sandboxes running so a failure can be inspected |
+
+Things worth knowing before the first run:
+
+- **`--ref` is the version that runs**, not your working tree. Push your branch first, or
+  the sandboxes will run `main`.
+- **`Dockerfile.daytona` is not `Dockerfile`.** The Daytona SDK reads `COPY` sources
+  directly and has no `.dockerignore` support, so the repo `Dockerfile`'s `COPY . /home/`
+  would upload your `.venv`, `workdir/` and `credentials.toml` into a remote image build.
+  The Daytona image carries only the dependency environment; the code arrives via `git`.
+  It only needs rebuilding when `uv.lock` changes — pass `--snapshot` to skip the build
+  entirely once you have one.
+- **Your credentials are copied into every sandbox**, because that file is how the harness
+  loads them. Use keys scoped to this work. Only the keys listed in `FORWARDED_KEYS` are
+  sent, and they go in as a file rather than as sandbox environment variables.
+- **`--with-fhir` gives every shard its own FHIR server**, each starting from the image's
+  pristine database. A third of MedAgentBench's tasks POST to the server and are graded on
+  what they wrote, so a shared server would let one shard's writes show up in another's
+  reads. `--sandboxes` is therefore also the isolation knob: `--sandboxes 60` on the test
+  split is one clean server per task. Each one costs ~2 minutes of startup and 8 GB of RAM,
+  and is torn down with its worker, so pair a high `--sandboxes` with `--max-concurrent`:
+  isolation is the shard count, cost is how many of them exist at the same time.
+- **The FHIR sandboxes are public** for the life of the run, since the workers reach them
+  over their preview URLs and hold no Daytona token. They serve only MedAgentBench's
+  synthetic patients, but they are world-reachable while the run lasts.
+- **The FHIR sandbox is built from `Dockerfile.fhir`, not from `jyxsu6/medagentbench`
+  directly.** That image is distroless — no shell, no coreutils — so Daytona's agent has
+  nothing to run inside it and every exec fails with `failed to resolve container IP` even
+  though the sandbox reports `STARTED`. `Dockerfile.fhir` lifts its `/app`, `/configs` and
+  `/data` onto a JRE base; nothing is uploaded from your checkout to build it.
+- **BioDSBench study data is fetched inside each sandbox** (~160 MB per sandbox), because
+  it is gitignored and so not in the clone.
+- **Losing the driver does not lose the run.** Each shard is started detached, so it keeps
+  going and keeps sending traces to Laminar; what stops is the download and the cleanup.
+  `scripts/daytona_collect.py` is that tail on its own — it adopts the sandboxes a run left
+  behind (matched on the `medagentgym` label, so nothing else on the account is touched),
+  waits for each to finish, unpacks its `workdir/` and deletes it. Pass `--extend-ttl` when
+  adopting: a sandbox's TTL runs from creation, and the run has already spent some of it.
+  It is safe to run while another run is in flight — sandboxes are paired by run id, not by
+  shard number, so a finished `shard-0` cannot delete a different run's `shard-0` server.
 
 ## Results
 

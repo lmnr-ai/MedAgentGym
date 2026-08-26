@@ -1,4 +1,11 @@
 #!/bin/bash
 set -e
 
-python3 /home/main.py --config /home/configs/gpt_4_1_mini/exp-gpt_4_1_mini-biocoder.yaml --async_run --parallel_backend joblib --n_jobs 5
+TASK_NAME="${TASK_NAME:-biocoder}"
+N_JOBS="${N_JOBS:-5}"
+NUM_ROLLOUTS="${NUM_ROLLOUTS:-1}"
+
+python /home/main.py \
+    --config_path "/home/configs/gpt_4_1_mini/exp-gpt_4_1_mini-${TASK_NAME}.yaml" \
+    --n_jobs "${N_JOBS}" \
+    --num_rollouts "${NUM_ROLLOUTS}"

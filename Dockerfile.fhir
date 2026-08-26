@@ -1,0 +1,29 @@
+# MedAgentBench's FHIR server, repackaged so Daytona can run it.
+#
+# `jyxsu6/medagentbench` is a distroless image: no shell, no `sleep`, no
+# coreutils, and it runs as uid 65532. Daytona starts a container and then
+# execs its own agent inside it, which that image cannot host -- the sandbox
+# comes up `STARTED` but every exec fails with "failed to resolve container IP",
+# because there is no container to resolve. So take its three payload
+# directories and drop them on an ordinary JRE base.
+#
+# Nothing here is copied from the build context, so the Daytona SDK uploads
+# nothing: it skips `COPY --from=` lines when it collects context.
+FROM jyxsu6/medagentbench:latest AS fhir
+
+FROM eclipse-temurin:17-jre-jammy
+
+# /app is the HAPI FHIR war, /configs the server config the war is pointed at,
+# and /data the ~1.4 GB H2 database holding MedAgentBench's synthetic patients.
+COPY --from=fhir /app /app
+COPY --from=fhir /configs /configs
+COPY --from=fhir /data /data
+
+ENV SPRING_CONFIG_LOCATION=file:///configs/application.yaml
+WORKDIR /app
+EXPOSE 8080
+
+# Daytona replaces this with its own agent; it exists so the container also
+# stays up under a plain `docker run`, and so nothing starts the server before
+# the driver is ready to wait for it.
+ENTRYPOINT ["sleep", "infinity"]

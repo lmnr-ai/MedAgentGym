@@ -35,7 +35,14 @@ class MedAgentBenchTask(AbstractEHRTask):
     ) -> None:
         super().__init__(task_id=task_id)
         self.task_id = task_id
-        self.fhir_api_base = "http://localhost:8080/fhir/"
+        # The server is a container the caller starts. It is on localhost when
+        # that container runs beside the harness, but under Daytona it is a
+        # separate sandbox reached over its preview URL, so the address has to
+        # be configurable. The trailing slash is load-bearing: every call site
+        # builds URLs as f"{fhir_api_base}Patient?...".
+        self.fhir_api_base = os.getenv("MEDAGENTBENCH_FHIR_URL", "http://localhost:8080/fhir/")
+        if not self.fhir_api_base.endswith("/"):
+            self.fhir_api_base += "/"
         self.task_list = None
         self.func_json_path = os.path.join(data_path, "funcs_v1.json")
         self.data_path = data_path
@@ -106,8 +113,15 @@ class MedAgentBenchTask(AbstractEHRTask):
         """
         super().setup_goal()
         # get the task configuration
-        answer_format = """answer = {"GET": ["60","S2874099"], "POST": ["http://localhost:8080/fhir/Observation", "payload]}
-The answers to the questions are listed in "GET" instead of the get commands, while the post url and payload are listed in "POST"."""
+        # The example URL has to match the server the agent is actually told to
+        # use, or it will POST to localhost while the server lives elsewhere.
+        answer_format = (
+            'answer = {"GET": ["60","S2874099"], "POST": ["'
+            + self.fhir_api_base
+            + 'Observation", "payload]}\n'
+            'The answers to the questions are listed in "GET" instead of the get commands, '
+            'while the post url and payload are listed in "POST".'
+        )
         self.goal = f"""You are an expert in using FHIR functions to assist medical professionals.
 {self.fhir_overall_information}
 
@@ -150,7 +164,7 @@ Question: {self.question}\n. The FHIR server base URL is {self.fhir_api_base}. D
         """
         
         if obs["type"] == "code_execution":
-            pred = obs['env_message']
+            pred = obs.get("stdout", obs["env_message"])
             if type(self.answer) == list:
                 ans = self.answer[0]
             else:
@@ -348,7 +362,11 @@ class MedAgentBenchAnswerEvaluator():
             assert "effectiveDateTime" in str(results) and "2023-11-13T10:15:00+00:00" in str(results)
             assert "status" in str(results) and "final" in str(results)
             assert "valueString" in str(results) and "118/77 mmHg" in str(results)
-            assert "reference" in str(results) and "Patient/S2380121" in str(results)
+            # Upstream hardcodes "Patient/S2380121" here, which is the eval_MRN of
+            # task3_1 and of no other case, so every other task3 datapoint fails no
+            # matter what the agent writes. Every other task in this file compares
+            # against case_data['eval_MRN'].
+            assert "reference" in str(results) and f"Patient/{case_data['eval_MRN']}" in str(results)
         except Exception as e:
             print(e, flush=True)
             return False

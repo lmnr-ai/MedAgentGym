@@ -1,6 +1,42 @@
 import os
+import re
+from datetime import date, datetime
 from .base import AbstractEHRTask
 import json
+
+# 55 of the 57 calculators produce a number, graded against [Lower Limit, Upper
+# Limit]. The other two produce a calendar date ("Estimated Due Date",
+# "Estimated of Conception") or a gestational age ("Estimated Gestational Age"),
+# and for those the limits are the answer repeated. Comparing them as floats is
+# what made all 60 of those datapoints unpassable, so each answer shape gets its
+# own parser and comparison.
+DATE_FORMATS = ("%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%Y-%m-%d")
+DATE_RE = re.compile(r"\d{1,4}[/-]\d{1,2}[/-]\d{2,4}")
+GESTATIONAL_RE = re.compile(r"(\d+)\s*weeks?\D+?(\d+)\s*days?", re.I)
+
+
+def parse_date(value: str) -> date | None:
+    match = DATE_RE.search(value)
+    if match is None:
+        return None
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.strptime(match.group(0), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def parse_gestational_age(value: str) -> tuple[int, int] | None:
+    match = GESTATIONAL_RE.search(value)
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def parse_number(value: str) -> float | None:
+    try:
+        return float(value.strip())
+    except (TypeError, ValueError):
+        return None
 
 overall_information = """
 You work in a hospital, and a common task in your work is to calculate some biological values of your patients. To do this, you need to identify from clinical notes what information is relevant, before using your clinical knowledge to calculate.
@@ -138,6 +174,41 @@ Question: {self.question}
         return obs
     
 
+    def compare(self, pred: str) -> bool:
+        """Compare the agent's printed answer to the ground truth.
+
+        The comparison follows the shape of the ground truth, not of the
+        prediction, so that a date question is never accidentally graded as a
+        number. Raises ValueError when the prediction cannot be read at all.
+        """
+        answer = self.answer[0] if isinstance(self.answer, list) else self.answer
+        pred = (pred or "").strip()
+
+        expected_date = parse_date(answer)
+        if expected_date is not None:
+            actual = parse_date(pred)
+            if actual is None:
+                raise ValueError(f"expected a date in M/D/Y format, got {pred!r}")
+            return actual == expected_date
+
+        expected_age = parse_gestational_age(answer)
+        if expected_age is not None:
+            actual = parse_gestational_age(pred)
+            if actual is None:
+                raise ValueError(f"expected a '<N> weeks, <M> days' answer, got {pred!r}")
+            return actual == expected_age
+
+        value = parse_number(pred)
+        if value is None:
+            raise ValueError(f"expected a number, got {pred!r}")
+        lower, upper = parse_number(str(self.lower_limit)), parse_number(str(self.upper_limit))
+        if lower is not None and upper is not None:
+            return lower <= value <= upper
+        expected = parse_number(answer)
+        if expected is None:
+            raise ValueError(f"ground truth {answer!r} is not a number")
+        return abs(value - expected) <= abs(expected) * 0.05
+
     def validate(self, chat_messages, obs):
         """
         Validate the task
@@ -151,35 +222,16 @@ Question: {self.question}
         """
         
         if obs["type"] == "code_execution":
-            pred = obs["env_message"]
-            if type(self.answer) == list:
-                ans = self.answer[0]
-            else:
-                ans = self.answer
-
-            correctness = False
+            pred = obs.get("stdout", obs["env_message"])
             try:
-                pred_float = float(pred)
-                
-                # Use lower/upper limits if available, otherwise use ±5% tolerance
-                if self.lower_limit is not None and self.upper_limit is not None:
-                    lower = float(self.lower_limit)
-                    upper = float(self.upper_limit)
-                    if lower <= pred_float <= upper:
-                        correctness = True
-                else:
-                    # Fallback to original logic: ±5% tolerance
-                    ans_float = float(self.answer)
-                    if ans_float >= pred_float * 0.95 or ans_float <= pred_float * 1.05:
-                        correctness = True
-            except Exception as e:
+                correctness = self.compare(pred)
+            except ValueError as e:
                 return (
                     0,
                     False,
                     "The code encountered with errors",
                     {"message": f"The code encountered with errors during evaluation. There seems to be something wrong with the final answer or not print it. Can you check the error message and try to fix it?\nError Message: {str(e)}"}
                 )
-
 
             if correctness:
                 return (

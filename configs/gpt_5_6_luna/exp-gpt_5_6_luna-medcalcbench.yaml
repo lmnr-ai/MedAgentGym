@@ -1,0 +1,21 @@
+Agent:
+  llm:
+    model_name: "gpt-5.6-luna"
+    max_new_tokens: 32768
+  n_retry: 3
+  retry_delay: 10
+Data:
+  metadata_path: "data/metadata.json"
+  data_path: "data/medcalcbench"
+Debugger:
+  model_name: "gpt-5.6-luna"
+  max_new_tokens: 8192
+Env:
+  n_retry: 3
+task: "medcalcbench"
+credentials_path: "./credentials.toml"
+work_dir: "./workdir/gpt_5_6_luna"
+result_dir_tag: "gpt-5_6-luna-medcalcbench"
+start_idx: 0
+end_idx: -1
+num_steps: 15

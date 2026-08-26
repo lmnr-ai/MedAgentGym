@@ -1,5 +1,6 @@
 import os
 from .base import AbstractEHRTask
+from .substitution import DEFAULT_PATTERN, insert_solution
 import json
 from ehr_gym.env.action.function import validate_code
 
@@ -81,11 +82,22 @@ class BiocoderTask(AbstractEHRTask):
                     self.task_list.append(json.loads(line))
         task_data = self.task_list[self.task_id]
         self.question = task_data['problem']
-        self.answer = validate_code(task_data['code'])["env_message"]
         self.code_id = task_data['idx']
         self.context = task_data['context']
         self.signature = task_data['signature']
-        self.context_pattern = "<<insert solution here>>"
+        self.context_pattern = DEFAULT_PATTERN
+        # The ground truth is the stdout of the reference program. Build it the
+        # same way the agent's submission will be built, so that a submission
+        # identical to the reference scores 1.
+        reference = insert_solution(self.context, task_data['solution'], self.context_pattern)
+        result = validate_code(reference)
+        if result["status"] != "SUCCESS":
+            raise RuntimeError(
+                f"BioCoder reference program for task {self.task_id} "
+                f"({self.code_id}) failed; this datapoint is not gradable:\n"
+                f"{result['env_message']}"
+            )
+        self.answer = result["stdout"]
         goal, info = self.setup_goal()
         return goal, info
 
@@ -119,7 +131,7 @@ class BiocoderTask(AbstractEHRTask):
 
     def validate(self, chat_messages, obs):
         if obs["type"] == "code_execution":
-            pred = obs['env_message']
+            pred = obs.get("stdout", obs["env_message"])
             correctness = self.answer == pred
             if correctness:
                 return (

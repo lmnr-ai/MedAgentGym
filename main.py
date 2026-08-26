@@ -1,228 +1,277 @@
 import argparse
-import os
+import json
 import logging
-from pathlib import Path
-import sys
+import os
 import time
-import toml
-from ehr_gym.env.base import EHREnv
-from ehr_gym.agent.base import EHRAgent
-from ehr_gym.utils.general import load_config, save_conversation_history
-import ray
 
-logging.basicConfig(
-    level=logging.INFO, format="%(name)s : %(levelname)-8s : %(message)s"
-)
+import toml
+from joblib import Parallel, delayed
+from lmnr import Laminar
+
+from ehr_gym import tracing
+from ehr_gym.agent.base import LLM_FAILURE, EHRAgent
+from ehr_gym.env.base import EHREnv
+from ehr_gym.utils.general import load_config, save_conversation_history
+
+logging.basicConfig(level=logging.INFO, format="%(name)s : %(levelname)-8s : %(message)s")
 logger = logging.getLogger(__name__)
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(description='Run EHR-Gym Experiments')
-    parser.add_argument('--config_path', type=str)
+# Identifies this harness in the trace metadata. `custom/` because it is a fork
+# of a benchmark runner rather than one of the named agent frameworks.
+HARNESS = "custom/MedAgentGym"
 
-    parser.add_argument('--task', type=str)
-    parser.add_argument('--credentials_path', type=str)
-    parser.add_argument('--work_dir', type=str)
-    parser.add_argument('--result_dir_tag', type=str)
+TASK_CLASSES = {
+    "biocoder": ("ehr_gym.env.task.biocoder", "BiocoderTask"),
+    "biodsbench": ("ehr_gym.env.task.biodsbench", "BioDSBenchTask"),
+    "medagentbench": ("ehr_gym.env.task.medagentbench", "MedAgentBenchTask"),
+    "medcalcbench": ("ehr_gym.env.task.medcalcbench", "MedCalBenchTask"),
+}
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Run MedAgentGym experiments")
+    parser.add_argument("--config_path", type=str)
+    parser.add_argument("--task", type=str, choices=sorted(TASK_CLASSES))
+    parser.add_argument("--credentials_path", type=str)
+    parser.add_argument("--work_dir", type=str)
+    parser.add_argument("--result_dir_tag", type=str)
     parser.add_argument("--start_idx", type=int)
     parser.add_argument("--end_idx", type=int)
     parser.add_argument("--num_steps", type=int)
-    parser.add_argument("--async_run", action="store_true", help="Run experiments asynchronously")
-    parser.add_argument("--n_jobs", type=int, help="Number of parallel jobs")
-    parser.add_argument("--parallel_backend", type=str, help="Parallel backend to use")
+    parser.add_argument("--n_jobs", type=int, default=1, help="Number of parallel jobs")
     parser.add_argument("--mode", type=str, default="test", help="train/test")
+    parser.add_argument(
+        "--num_rollouts",
+        type=int,
+        default=1,
+        help="Trajectories to sample per task. >1 writes history_<idx>_<rollout>.json",
+    )
+    parser.add_argument(
+        "--rollout_indices_path",
+        type=str,
+        help="JSON file of {task: {mode: [idx, ...]}}; overrides --start_idx/--end_idx",
+    )
     return parser.parse_args()
 
+
 def convert_config_to_args(config, args):
-    if not args.task:
-        args.task = config['task']
-    if not args.credentials_path:
-        args.credentials_path = config['credentials_path']
-    if not args.work_dir:
-        args.work_dir = config['work_dir']
-    if not args.result_dir_tag:
-        args.result_dir_tag = config['result_dir_tag']
-    if not args.start_idx:
-        args.start_idx = config['start_idx']
-    if not args.end_idx:
-        args.end_idx = config['end_idx']
-    if not args.num_steps:
-        args.num_steps = config['num_steps']
+    for key in (
+        "task",
+        "credentials_path",
+        "work_dir",
+        "result_dir_tag",
+        "start_idx",
+        "end_idx",
+        "num_steps",
+    ):
+        if getattr(args, key) is None:
+            setattr(args, key, config[key])
     return args
 
-def load_credentials(credentials_path):
-    return toml.load(credentials_path)
 
-def set_environment_variables(credentials):
+def set_environment_variables(credentials_path):
+    """Make the credentials file the only source of credentials for this run.
+
+    The machine this runs on may already carry an ambient `LMNR_PROJECT_API_KEY`
+    belonging to something else entirely. Inheriting it is worse than having no
+    key at all -- the run looks traced, and a few hundred trajectories land in a
+    project nobody is watching -- so a Laminar key the file does not name is
+    removed rather than left in place.
+    """
+    credentials = toml.load(credentials_path)
     for key, value in credentials.items():
         os.environ[key] = value
+    for key in ("LMNR_PROJECT_API_KEY", "LMNR_BASE_URL"):
+        if key not in credentials:
+            os.environ.pop(key, None)
 
-def create_env_config_dir(work_dir, task, result_dir_tag):
-    env_config_tmp_dir = os.path.join(work_dir, task, result_dir_tag)
-    os.makedirs(env_config_tmp_dir, exist_ok=True)
-    return env_config_tmp_dir
 
 def get_task_class(task):
-    if task == 'mimic_iii':
-        from ehr_gym.env.task.mimic_iii import MimiciiiEHRTask
-        return MimiciiiEHRTask
-    elif task == 'biocoder':
-        from ehr_gym.env.task.biocoder import BiocoderTask
-        return BiocoderTask
-    elif task == 'eicu':
-        from ehr_gym.env.task.eicu import EicuEHRTask
-        return EicuEHRTask
-    elif task == 'treqs':
-        from ehr_gym.env.task.treqs import TreqsEHRTask
-        return TreqsEHRTask
-    elif task == 'medcalcbench':
-        from ehr_gym.env.task.medcalcbench import MedCalBenchTask
-        return MedCalBenchTask
-    elif task == 'medagentbench':
-        from ehr_gym.env.task.medagentbench import MedAgentBenchTask
-        return MedAgentBenchTask
-    elif task == 'ehrshot':
-        from ehr_gym.env.task.ehrshot import EHRShotTask
-        return EHRShotTask
-    elif task == 'ehr_seqsql':
-        from ehr_gym.env.task.ehr_seqsql import EHRSeqSQLEHRTask
-        return EHRSeqSQLEHRTask
-    elif task == 'ehrcon':
-        from ehr_gym.env.task.ehrcon import EHRCONEHRTask
-        return EHRCONEHRTask
-    elif task == "biodsbench":
-        from ehr_gym.env.task.biodsbench import BioDSBenchTask
-        return BioDSBenchTask
-    elif task == "npowerai":
-        from ehr_gym.env.task.npowerai import NPowerAITask
-        return NPowerAITask
-    elif task == "mimic_extract":
-        from ehr_gym.env.task.mimic_extract import MIMICEXTRACTEHRTask
-        return MIMICEXTRACTEHRTask
-    else:
-        raise ValueError(f'Invalid task: {task}')
+    if task not in TASK_CLASSES:
+        raise ValueError(f"Invalid task: {task}")
+    module_name, class_name = TASK_CLASSES[task]
+    module = __import__(module_name, fromlist=[class_name])
+    return getattr(module, class_name)
 
-def sequential_run_experiments(args, config):
-    success_rate = 0
-    for idx in range(args.start_idx, args.end_idx):
-        success = run_single_experiment(args, config, idx)
-        success_rate += success
-    success_rate /= (args.end_idx - args.start_idx)
-    print('-'*50)
-    print(f'Success Rate: {success_rate}')
 
-def run_single_experiment(args, config, idx):
-    agent_config = config['Agent']
-    data_config = config['Data']
-    debugger_config = config['Debugger']
-    save_dir = os.path.join(args.work_dir, args.task, args.result_dir_tag, args.mode)
-    output_path = os.path.join(save_dir, f'history_{idx}.json')
-    if os.path.exists(output_path):
-        logger.info(f"Experiment {idx} already exists. Skipping...")
-        return 0
-    print(f"Running experiment for index {idx}...")
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-    
-    task_cls = get_task_class(args.task)
-    task_kwargs = {
-        'data_path': data_config['data_path'],
-        'debugger_config': debugger_config,
-        'mode': args.mode,
+def history_path(save_dir, idx, rollout_idx, num_rollouts):
+    name = f"history_{idx}.json" if num_rollouts == 1 else f"history_{idx}_{rollout_idx}.json"
+    return os.path.join(save_dir, name)
+
+
+def trajectory_metadata(args, config, idx, rollout_idx, result):
+    """The trace metadata every trajectory carries, in the shared schema.
+
+    `gt_event_identified` is a *failure* flag: true when the trajectory did not
+    pass, false when it did. A rollout that never reached a grader — the LLM
+    endpoint gave up, or the harness crashed — counts as a failure too, so this
+    is exactly `not success` and is never absent. `outcome` is what separates
+    the two kinds of failure.
+    """
+    return {
+        "source": args.task,
+        "domain": "healthcare",
+        "gt_event_identified": not result["success"],
+        "generated": True,
+        "harness": HARNESS,
+        "model": config["Agent"]["llm"]["model_name"],
+        # Steps actually taken, not the budget; the budget is `step_budget`.
+        "num_steps": result["steps"],
+        # General metadata, flattened into the same level by convention.
+        "split": args.mode,
+        "task_index": idx,
+        "rollout": rollout_idx,
+        "score": result["score"],
+        "outcome": result["reason"],
+        "step_budget": args.num_steps,
+        "run_tag": args.result_dir_tag,
+        "debugger_model": config["Debugger"]["model_name"],
     }
-    env = EHREnv(task_entrypoint=task_cls, task_kwargs=task_kwargs)
+
+
+def run_single_rollout(args, config, idx, rollout_idx, output_path):
+    """Run one trajectory for task `idx` and persist it. Returns 1 on success."""
+    # What the metadata says if `_rollout` raises. `set_trace_metadata` may be
+    # called at most once per trace, so it happens in the `finally` rather than
+    # at span start: `num_steps` and the verdict are not known until the end,
+    # and a trajectory that crashed should still be findable.
+    result = {"success": 0, "score": 0, "steps": 0, "reason": "crashed"}
+    with Laminar.start_as_current_span(
+        f"{args.task}[{args.mode}/{idx}]",
+        input={"task": args.task, "mode": args.mode, "index": idx, "rollout": rollout_idx},
+        session_id=args.result_dir_tag,
+        tags=[args.task, args.mode],
+    ):
+        try:
+            result = _rollout(args, config, idx, output_path)
+            Laminar.set_span_output(result)
+            return result["success"]
+        finally:
+            Laminar.set_trace_metadata(
+                trajectory_metadata(args, config, idx, rollout_idx, result)
+            )
+
+
+def _rollout(args, config, idx, output_path):
+    agent_config = config["Agent"]
+    task_cls = get_task_class(args.task)
+    env = EHREnv(
+        task_entrypoint=task_cls,
+        task_kwargs={
+            "data_path": config["Data"]["data_path"],
+            "debugger_config": config["Debugger"],
+            "mode": args.mode,
+        },
+    )
     agent = EHRAgent(agent_config, permitted_actions=task_cls.permitted_actions)
-    obs, info = env.reset(idx)
+    try:
+        return _run_task(args, config, idx, output_path, env, agent)
+    finally:
+        # Drops the task's scratch directory. A sandbox runs hundreds of tasks in
+        # sequence, so anything the agent wrote or installed has to go with it.
+        env.close()
+
+
+def _run_task(args, config, idx, output_path, env, agent):
+    agent_config = config["Agent"]
+    obs, _ = env.reset(idx)
+
     attempts = 0
-    for step_idx in range(args.num_steps):
+    done = False
+    reward = 0
+    steps = 0
+    for step in range(args.num_steps):
+        steps = step + 1
         action, params = agent.act(obs)
-        while action == 'error':
-            n_retry = config['Agent']['n_retry']
-            logger.error(f"Task {args.task}-{idx} Failure: Agent action failed for {n_retry} times.")
+        while action.startswith(LLM_FAILURE):
+            logger.error(
+                f"Task {args.task}-{idx} failure: agent action failed "
+                f"for {agent_config['n_retry']} times."
+            )
             attempts += 1
-            if attempts >= config['Env']['n_retry']:
-                agent.conversation_history.append({'result': 'failure'})
-                success = 0
-                output_path = os.path.join(save_dir, f'history_{idx}.json')
+            if attempts >= config["Env"]["n_retry"]:
+                agent.conversation_history.append({"result": "failure"})
                 save_conversation_history(agent.conversation_history, output_path)
-                return success
+                # The API was unreachable, so nothing the agent did was ever put
+                # in front of a grader. `reason` carries the LLM failure so the
+                # trajectory is still distinguishable from one that was graded
+                # and lost.
+                return {"success": 0, "score": 0, "steps": steps, "reason": action}
             time.sleep(1)
             action, params = agent.act(obs)
-        obs, reward, done, truncated, info = env.step(action, **params)
+        obs, reward, done, _, _ = env.step(action, **params)
         if done:
             break
 
     if done:
-        agent.conversation_history.append({'result': 'success', 'score': reward})
-        if args.task == 'ehrshot':
-            success = reward
-        else:
-            success = 1
+        agent.conversation_history.append({"result": "success", "score": reward})
     else:
-        agent.conversation_history.append({'result': 'failure'})
-        success = 0
-    output_path = os.path.join(save_dir, f'history_{idx}.json')
+        agent.conversation_history.append({"result": "failure"})
     save_conversation_history(agent.conversation_history, output_path)
-    return success
+    return {
+        "success": 1 if done else 0,
+        "score": reward,
+        "steps": steps,
+        "reason": "solved" if done else "step budget exhausted",
+    }
 
-run_single_experiment_ray = ray.remote(run_single_experiment)
 
-def async_run_experiments(args, config, n_jobs, parallel_backend="ray"):
-    if args.start_idx > args.end_idx:
-        logging.warning("No experiments to run")
+def run_single_experiment(args, config, idx):
+    """Run every requested rollout for task `idx`, skipping ones already on disk."""
+    # This is the joblib entry point, so it is also the first thing that runs in
+    # a worker process -- and therefore where tracing has to be set up.
+    tracing.initialize()
+    save_dir = os.path.join(args.work_dir, args.task, args.result_dir_tag, args.mode)
+    os.makedirs(save_dir, exist_ok=True)
+    successes = 0
+    for rollout_idx in range(args.num_rollouts):
+        output_path = history_path(save_dir, idx, rollout_idx, args.num_rollouts)
+        if os.path.exists(output_path):
+            logger.info(f"Trajectory {output_path} already exists. Skipping...")
+            continue
+        logger.info(f"Running experiment for index {idx} (rollout {rollout_idx})...")
+        try:
+            successes += run_single_rollout(args, config, idx, rollout_idx, output_path)
+        finally:
+            tracing.flush()
+    return successes
+
+
+def run_experiments(args, config, indices):
+    if not indices:
+        logger.warning("No experiments to run")
         return
-    success_rate = 0
-    try:
-        if parallel_backend == 'joblib':
-            from joblib import Parallel, delayed
-            indices = range(args.start_idx, args.end_idx)
-            # split sequential (should be no longer needed with dependencies)
-            results = Parallel(n_jobs=n_jobs, prefer="processes")(
-                delayed(run_single_experiment)(args, config, idx)
-                for idx in indices
-            )
-            success_rate = sum(results) / len(results)
-            print(f'Success Rate: {success_rate}')
-        elif parallel_backend == "ray":
-            ray.init(num_cpus=n_jobs)
-            indices = range(args.start_idx, args.end_idx)
-            futures = [
-                run_single_experiment_ray.remote(args, config, idx)
-                for idx in indices
-            ]
-            results = ray.get(futures)
-            success_rate = sum(results) / len(results)
-            print(f'Success Rate: {success_rate}')
-            ray.shutdown()
-        else:
-            raise ValueError(f"Unsupported parallel backend: {parallel_backend}")
-    finally:
-        logging.info("All jobs are finished. Calling agent_args.close() on all agents...")
-        logger.info('Experiment finished.')
-        log_file = os.path.join(args.work_dir, "running_records.jsonl")
-        with open(log_file, "a+") as f:
-            f.write(f"Experiment {args.task}: {success_rate}\n")
+    results = Parallel(n_jobs=args.n_jobs, prefer="processes")(
+        delayed(run_single_experiment)(args, config, idx) for idx in indices
+    )
+    success_rate = sum(results) / (len(results) * args.num_rollouts)
+    print("-" * 50)
+    print(f"Success Rate: {success_rate}")
+
+    os.makedirs(args.work_dir, exist_ok=True)
+    with open(os.path.join(args.work_dir, "running_records.jsonl"), "a+") as f:
+        f.write(f"Experiment {args.task}: {success_rate}\n")
+
+
+def resolve_indices(args, config):
+    if args.rollout_indices_path:
+        with open(args.rollout_indices_path, "r") as f:
+            return json.load(f)[args.task][args.mode]
+    end_idx = args.end_idx
+    if end_idx == -1:
+        with open(config["Data"]["metadata_path"], "r") as f:
+            end_idx = json.load(f)[args.task][args.mode]
+    return list(range(args.start_idx, end_idx))
+
 
 def main():
-    # initialization
     args = parse_arguments()
-    if args.config_path:
-        config = load_config(args.config_path)
+    config = load_config(args.config_path) if args.config_path else {}
+    if config:
         args = convert_config_to_args(config, args)
-    if args.end_idx == -1:
-        import json
-        metadata_file = config['Data']['metadata_path']
-        with open(metadata_file, 'r') as f:
-            metadata = json.load(f)
-        args.end_idx = metadata[args.task][args.mode]
-    credentials = load_credentials(args.credentials_path)
-    set_environment_variables(credentials)
-    env_config_tmp_dir = create_env_config_dir(args.work_dir, args.task, args.result_dir_tag)
+    set_environment_variables(args.credentials_path)
+    run_experiments(args, config, resolve_indices(args, config))
 
-    # run experiments
-    if not args.async_run:
-        sequential_run_experiments(args, config)
-    else:
-        async_run_experiments(args, config, args.n_jobs, args.parallel_backend)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

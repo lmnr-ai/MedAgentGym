@@ -1,42 +1,25 @@
-import os
-import re
 import json
-import time
-import subprocess
-from dataclasses import dataclass, field
-from abc import ABC
-import pandas as pd
-import numpy as np
-import datetime as datetime
-import gymnasium as gym
-from gymnasium import spaces
 import logging
-from ehr_gym.env.task.base import AbstractEHRTask
-from ehr_gym.env.spaces import AnyDict, Float, Unicode
+import re
+import shutil
+import tempfile
+import time
+from abc import ABC
+from typing import Callable, Optional
+
+import gymnasium as gym
+from lmnr import Laminar
+
+from ehr_gym.env.action.action_set import ACTION_SET
+from ehr_gym.env.action.function import set_workspace
 from ehr_gym.env.chat import Chat
-from ehr_gym.env.action.action_set import BasicActionSet
-from ehr_gym.llm.chat_api import AzureModelArgs
-from typing import Any, Optional, Callable
+from ehr_gym.env.spaces import AnyDict, Float, Unicode
+from ehr_gym.env.task.base import AbstractEHRTask
+from ehr_gym.env.task.substitution import insert_solution
+from ehr_gym.llm.chat_api import make_chat_model
 
-
-logging.basicConfig(
-    level=logging.INFO, format="%(name)s : %(levelname)-8s : %(message)s"
-)
 logger = logging.getLogger(__name__)
 
-# Base record classes for different types of environment interactions
-@dataclass
-class BaseRecord:
-    timestamp: datetime
-    code: str = None
-    output: str = None
-    success: bool = None
-    execution_time: float = None
-
-@dataclass
-class InfoRequestRecord(BaseRecord):
-    info_type: str = field(default="")
-    content: Any = None
 
 class EHREnv(gym.Env, ABC):
     """The main EHRGym class, which encapsulates instruction-following EHR question-answering into a Gymnasium environment."""
@@ -53,7 +36,7 @@ class EHREnv(gym.Env, ABC):
                 "debugger_config": None,
             },
             # agent-related arguments
-            action_mapping: Optional[Callable] = BasicActionSet().action_set,
+            action_mapping: Optional[Callable] = ACTION_SET,
         ):
         """
         Instantiate a ready to use EHREnv gym environment.
@@ -92,29 +75,34 @@ class EHREnv(gym.Env, ABC):
         # initialize chat
         self.chat: Chat = None
 
-        self.terminate_on_infeasible = False
-
-        debugger_config = self.task_kwargs.get("debugger_config", None)
-        self.debugger = AzureModelArgs(
-            model_name=debugger_config["model_name"],
-            temperature=debugger_config["temperature"],
-            max_new_tokens=debugger_config["max_new_tokens"],
-            deployment_name=debugger_config["deployment_name"],
-            log_probs=debugger_config["log_probs"],
-        ).make_model()
+        self.debugger = make_chat_model(self.task_kwargs.get("debugger_config"))
         self.env_history = []
         self.need_context = False
+        # Scratch directory the agent's code runs in, one per task. See
+        # `ehr_gym.env.action.function` for what it isolates.
+        self.workspace = None
+
+    def _open_workspace(self):
+        """Give the task a private directory to run code in, and point the actions at it."""
+        self._close_workspace()
+        self.workspace = tempfile.mkdtemp(prefix="medagentgym-rollout-")
+        set_workspace(self.workspace)
+
+    def _close_workspace(self):
+        """Throw the task's scratch directory away, whatever it left in there."""
+        set_workspace(None)
+        if self.workspace:
+            shutil.rmtree(self.workspace, ignore_errors=True)
+            self.workspace = None
 
     def close(self):
         if self.task:
             self.task.teardown()
             self.task = None
-        if self.chat:
-            self.chat.close()
-            self.chat = None
-        if self.env_history != []:
-            self.env_history = []
-    
+        self._close_workspace()
+        self.chat = None
+        self.env_history = []
+
     def reset(self, task_id, *args, **kwargs):
         """
         Reset the environment to a new task.
@@ -124,32 +112,21 @@ class EHREnv(gym.Env, ABC):
         if self.task:
             self.task.teardown()
             self.task = None
-        if self.chat:
-            self.chat.close()
-            self.chat = None
+        self.chat = None
         self.env_history = []
-        
+
+        # Before the task is built, not after: `BiocoderTask.setup` runs the
+        # reference program to derive the ground truth, and that execution belongs
+        # to this task's workspace like any other.
+        self._open_workspace()
+
         # create a new task
         self.task = self.task_entrypoint(task_id=task_id, **self.task_kwargs)
 
-        def override_property(task, env, property):
-            """Extract property value from env if not None, otherwise from task."""
-            env_value = getattr(env, property)
-            task_value = getattr(task, property)
-            if env_value is None:
-                return task_value
-            else:
-                if task_value is not None:
-                    logger.warning(
-                        f"Overriding the task's {property} parameter ({repr(task_value)} => {repr(env_value)}). This might change the task's behaviour and difficulty."
-                    )
-                return env_value
-        
-        # fetch task's desired parameters for setup
         self.chat = Chat()
         self.chat.add_message(
             role="assistant",
-            content="Hi! I am your EHR assistant, I can perform tasks based on the EHR data. What can I help you with?"
+            content="Hi! I am your assistant, I can solve coding-based biomedical tasks. What can I help you with?"
         )
 
         # setup the task goal
@@ -185,10 +162,10 @@ class EHREnv(gym.Env, ABC):
 
         # extract obs and information from the environment
         obs = self._get_obs()
-        if "context_info" in obs["info"]:
-            self.need_context = True
-        else:
-            self.need_context = False
+        # Tasks that score the agent's snippet inside a template expose a
+        # `context` / `context_pattern` pair; their submissions get spliced into
+        # that template before execution.
+        self.need_context = getattr(self.task, "context_pattern", None) is not None
         self.env_history.append(obs)
         info = {}
         info["task_goal"] = task_goal
@@ -209,6 +186,20 @@ class EHREnv(gym.Env, ABC):
             done: whether the environment is done.
             info: additional information about the environment.
         """
+        name = action if action in self.action_mapping else "invalid_action"
+        with Laminar.start_as_current_span(f"env.{name}", input=kwargs, span_type="TOOL"):
+            obs, reward, done, truncated, info = self._step(action, **kwargs)
+            Laminar.set_span_output(
+                {
+                    "type": obs["type"],
+                    "reward": reward,
+                    "done": done,
+                    "env_message": obs.get("env_message"),
+                }
+            )
+            return obs, reward, done, truncated, info
+
+    def _step(self, action: str, **kwargs) -> tuple:
         # save the action
 
         self.last_action = action
@@ -223,17 +214,6 @@ class EHREnv(gym.Env, ABC):
         info["action_exec_start"] = time.time()
         info["action_exec_timeout"] = 0
 
-        def send_message_to_user(text: str):
-            if not isinstance(text, str):
-                raise ValueError(f"Forbidden value: {text} is not a string")
-            self.chat.add_message(role="assistant", content=text)
-        
-        def report_infeasible_instructions(reason: str):
-            if not isinstance(reason, str):
-                raise ValueError(f"Forbidden value: {reason} is not a string")
-            self.chat.add_message(role="infeasible", content=reason)
-            self.infeasible_message_received = True
-        
         # try to execute the action
         logger.debug(f"Executing action")
         try:
@@ -243,8 +223,9 @@ class EHREnv(gym.Env, ABC):
                 kwargs["debugger"] = self.debugger
                 kwargs["history"] = self.env_history
             elif action == 'validate_code' and self.need_context:
-                kwargs["code"] = self.task.context.replace(self.task.context_pattern, '\n'+kwargs['code']+'\n')
-                # print(kwargs["code"])
+                kwargs["code"] = insert_solution(
+                    self.task.context, kwargs["code"], self.task.context_pattern
+                )
             results = action_function(**kwargs)
         except Exception as e:
             # print(f"Error: {e}")
@@ -268,14 +249,17 @@ class EHREnv(gym.Env, ABC):
         logger.debug(f"Initiating task validation")
         reward, done, user_message, task_info = self._task_validate(obs)
         info["task_info"] = task_info
+        # The grader's verdict is the only signal that a program which ran fine
+        # still produced the wrong answer. Upstream computed it and dropped it
+        # here, so the agent saw nothing but its own stdout and resubmitted the
+        # same code until the step budget ran out.
+        feedback = task_info.get("message")
+        if feedback and feedback != obs.get("env_message"):
+            obs["env_message"] = f"{obs.get('env_message', '')}\n\n{feedback}".strip()
         logger.debug(f"Task validated")
 
         # new step API wants a 5-tuple (gymnasium style)
-        terminated = done or (
-            self.terminate_on_infeasible and self.infeasible_message_received
-        ) # task or agent can terminate the episode
-        truncated = False
-        return obs, reward, terminated, truncated, info
+        return obs, reward, done, False, info
     
     def _task_validate(self, obs):
         reward, done, user_message, task_info = self.task.validate(self.chat.messages, obs)

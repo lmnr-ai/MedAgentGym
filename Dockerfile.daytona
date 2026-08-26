@@ -1,0 +1,38 @@
+# Image for the Daytona sandboxes that `scripts/daytona_run.py` drives.
+#
+# Deliberately *not* the same as ./Dockerfile. That one does `COPY . /home/`,
+# which under Daytona would upload the whole working tree -- .venv, workdir/,
+# and credentials.toml included -- into a remote image build, because the SDK
+# reads COPY sources directly and has no .dockerignore support. Here the image
+# carries only the dependency environment and the repo is cloned per sandbox at
+# a pinned ref, so nothing local and nothing secret is ever baked in.
+FROM python:3.11-slim-bookworm
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/home/.venv \
+    PATH="/home/.venv/bin:$PATH"
+
+# build-essential + zlib for the bioinformatics wheels with no manylinux build,
+# git to clone the repo, curl for health checks against the FHIR sandbox.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential ca-certificates curl git zlib1g-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /home
+
+# Only the dependency declarations, so the (slow) resolve is baked into the
+# image and every sandbox starts with a warm venv. `--no-install-project`
+# because the project itself arrives later, with the clone.
+COPY pyproject.toml uv.lock .python-version /home/
+RUN uv sync --locked --extra tasks --no-install-project
+
+# Daytona starts the container and then execs into it, so the image needs a
+# process that does not exit. It replaces the entrypoint with its own agent, so
+# this is only a fallback -- but without it a plain `docker run` of this image
+# would exit immediately and the build would look broken.
+ENTRYPOINT ["sleep", "infinity"]

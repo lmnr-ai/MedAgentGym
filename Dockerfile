@@ -1,80 +1,29 @@
-# 1. Select NVIDIA CUDA Development Base Image
-# Using 'devel' tag for broader compatibility, including compiling CUDA extensions.
-# Using Ubuntu 22.04 LTS for stability.
-# ARG allows easy modification of these versions at build time if needed.
-ARG CUDA_VERSION=12.5.0
-ARG OS_VERSION=ubuntu22.04
-ARG TASK
-FROM nvidia/cuda:${CUDA_VERSION}-devel-${OS_VERSION}
+# CPU-only image: the harness talks to hosted LLM APIs (Azure AI Foundry / OpenAI),
+# so there is no CUDA runtime, no torch and no local model serving here.
+FROM python:3.11-slim-bookworm
 
-# 2. Set Environment Variables
-# - Avoid interactive prompts during package installation.
-# - Ensure Python output is sent straight to terminal (no buffering).
-# - Ensure container runtime has access to all GPUs and necessary capabilities.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/home/.venv \
+    PATH="/home/.venv/bin:$PATH"
 
-# 3. Install System Dependencies, Python 3.11, pip, and basic tools
-# - Update package lists.
-# - Install 'software-properties-common' to manage repositories (for PPA).
-# - Add the 'deadsnakes' PPA for newer Python versions.
-# - Install Python 3.11, development headers (-dev), venv, and pip.
-# - Install 'build-essential' (for compiling C/C++ code) and 'git' (for `pip install -e`).
-# - Install common utilities like 'curl', 'wget', 'ca-certificates'.
-# - Set Python 3.11 as the default 'python' and 'python3'.
-# - Clean up apt cache afterwards to reduce image size.
+# build-essential + git are needed to build the few bioinformatics wheels that
+# have no manylinux build, and because agents may `pip install` at runtime.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    software-properties-common \
-    build-essential \
-    git \
-    curl \
-    wget \
-    ca-certificates \
-    && add-apt-repository ppa:deadsnakes/ppa && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
-    python3.11 \
-    python3.11-dev \
-    python3.11-venv \
-    python3-pip \
-    && apt-get remove -y python3-pip && apt-get autoremove -y && \
-    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 && \
-    update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 && \
-    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 && \
+    apt-get install -y --no-install-recommends build-essential curl git zlib1g-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Verify Python and Pip versions (Optional - uncomment during debugging)
-# RUN python --version
-# RUN pip --version
-
-# 4. Set Working Directory
 WORKDIR /home
 
-# 5. Copy Project Code
-# Copy the current directory contents into the container at /home
+# Dependency layer: only invalidated when the lockfile changes.
+COPY pyproject.toml uv.lock .python-version /home/
+RUN uv sync --locked --extra tasks --no-install-project
+
 COPY . /home/
 RUN chmod +x /home/entrypoint.sh
 
-# 6. Install Python Dependencies
-# - Upgrade pip, setuptools, and wheel to the latest versions first.
-# - Install project dependencies using 'pip install -e .'
-#   (Editable mode often used for development).
-# - Use --no-cache-dir to reduce layer size.
-# - Use 'python -m pip' to ensure the correct pip associated with python3.11 is used.
-RUN python -m pip install --no-cache-dir --upgrade pip wheel setuptools
-RUN python -m pip install --no-cache-dir -r requirements.txt
-RUN python -m pip install --no-cache-dir torch
-# RUN if [ "$TASK" = "biocoder" ]; then \
-#     python -m pip install --no-cache-dir -r ./data/biocoder/requirements_biocoder.txt; \
-#     fi
-
-# Note: If your Python packages have additional system library dependencies
-# (e.g., libgl1-mesa-glx, libsm6, libxext6 for OpenCV),
-# you MUST install them using 'apt-get install' in step 3 above.
-
-# 7. Set Entrypoint
-# Specifies the command to run when the container starts.
 ENTRYPOINT ["/home/entrypoint.sh"]
