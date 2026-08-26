@@ -228,13 +228,34 @@ def shard_state(sandbox) -> str:
     return (probe.result or "").strip() or "unknown"
 
 
-def launch(sandbox, inner: str, label: str, attempts: int = 5) -> None:
+def settled_shard_state(sandbox, label: str, attempts: int = 6, delay: int = 15) -> str:
+    """`shard_state`, asked repeatedly until the sandbox gives a usable answer.
+
+    A sandbox busy enough to time out one `exec` is usually busy enough to time
+    out the next, so a single follow-up question answers `unknown` far more often
+    than the shard is actually unknowable.
+    """
+    for _ in range(attempts):
+        time.sleep(delay)
+        state = shard_state(sandbox)
+        if state != "unknown":
+            return state
+        print(f"[{label}] sandbox not answering, asking again")
+    return "unknown"
+
+
+def launch(sandbox, inner: str, label: str, attempts: int = 5) -> bool:
     """Start the shard in the background, retrying a flaky `exec`.
+
+    Returns whether the shard is confirmed to be running. `False` means only that
+    the sandbox would not say -- the job may well be running -- so the caller has
+    to resolve it rather than start another one.
 
     Daytona's `exec` answers `command execution timeout` often enough under load
     to lose a shard on the one call that starts it -- and it says that whether or
     not the command it was given actually started, so a blind retry can leave two
-    copies of the run racing over the same output files. Ask the sandbox first.
+    copies of the run racing over the same output files. Ask the sandbox first,
+    and only retry on an answer that rules that out.
     """
     for attempt in range(1, attempts + 1):
         try:
@@ -244,20 +265,22 @@ def launch(sandbox, inner: str, label: str, attempts: int = 5) -> None:
                 cwd=REMOTE_REPO,
                 timeout=60,
             )
-            return
+            return True
         except DaytonaError as e:
             print(f"[{label}] launch attempt {attempt}/{attempts} failed: {e}")
-            time.sleep(15)
-            state = shard_state(sandbox)
-            if state in ("running", "done"):
-                print(f"[{label}] the shard started anyway ({state})")
-                return
-            if state == "unknown":
-                # Neither "it is running" nor "it is not", so starting another
-                # one is not safe. Waiting is: the poll loop below tolerates a
-                # silent sandbox, and `deadline` still bounds the whole thing.
-                print(f"[{label}] sandbox not answering, waiting before retrying")
-                time.sleep(45)
+            state = settled_shard_state(sandbox, label)
+            if state != "idle":
+                # `running`/`done`: it started despite the error. `unknown`: the
+                # sandbox will not say whether it did, and the retry above is not
+                # idempotent -- it would `rm` the markers a live shard reports
+                # through and put a second `main.py` on its output files. Neither
+                # is something to launch over, so hand the shard to the caller's
+                # poll loop, which tolerates a silent sandbox and is bounded by
+                # `--timeout`.
+                print(f"[{label}] shard state is {state}, not launching again")
+                return state != "unknown"
+            # `idle` is the sandbox saying the job is definitively not there:
+            # nothing to race with, so go round again.
     raise RuntimeError(f"[{label}] could not start the shard in {attempts} attempts")
 
 
@@ -276,7 +299,17 @@ def run_detached(sandbox, argv: list[str], timeout: int, label: str) -> int:
     never starts also never writes the exit code this polls for.
     """
     inner = f"touch {STARTED_FILE}; {shlex.join(argv)}; echo $? > {EXIT_CODE_FILE}"
-    launch(sandbox, inner, label)
+    if not launch(sandbox, inner, label):
+        # `launch` could not get an answer out of the sandbox and would not start
+        # a second copy over a job that might be live. Ask again, because the
+        # alternative is polling a shard that never started until `--timeout`
+        # expires -- and a run costs as much wall clock as its slowest shard.
+        # `idle` this long after the attempt is not the launch race: the job
+        # touches its marker before doing anything else.
+        state = settled_shard_state(sandbox, label)
+        if state == "idle":
+            raise RuntimeError(f"[{label}] the shard never started")
+        print(f"[{label}] shard state is {state}, polling anyway")
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(30)

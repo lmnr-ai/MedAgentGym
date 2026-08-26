@@ -162,6 +162,16 @@ flags. The non-obvious parts:
   long `exec`: a multi-hour HTTP response is at the mercy of every proxy in between.
   Sandboxes are created with `auto_stop_interval=0` (the 15-minute idle timer would stop a
   silent shard) and a `ttl_minutes` backstop for a driver that dies before cleanup.
+- **Starting a shard is not idempotent, and `exec` failures do not mean the command did not
+  run.** Daytona answers `command execution timeout` under load whether or not it started
+  what it was given, and `launch` opens with `rm -f /tmp/run.started /tmp/exit_code` — so a
+  blind retry can put a second `main.py` on one shard's `workdir/` *and* delete the markers
+  the first one reports through, which reads downstream as a shard that never finished.
+  `launch` therefore retries only after `shard_state` says `idle`, the one answer that rules
+  a live job out; `running`/`done` mean it started anyway, and `unknown` (`settled_shard_state`
+  asked six times and got nothing) hands the shard to `run_detached`'s poll loop instead,
+  which tolerates a silent sandbox and is bounded by `--timeout`. Marker files, not `pgrep`:
+  `procps` is not in the image and a missing `pgrep` would report every running shard `idle`.
 - `MEDAGENTBENCH_FHIR_URL` overrides `http://localhost:8080/fhir/` in
   `env/task/medagentbench.py`. The prompt's example URL is built from the same value —
   they must not drift, or the agent POSTs to localhost while the server is elsewhere.
