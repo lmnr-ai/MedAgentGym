@@ -145,6 +145,16 @@ flags. The non-obvious parts:
   lands beside it at `/home/MedAgentGym`, so the per-sandbox `uv sync` is nearly a no-op.
   Commands must run `/home/.venv/bin/python` and set `UV_PROJECT_ENVIRONMENT`, not rely on
   the image's `ENV` surviving into Daytona's exec.
+- **Anything between `client.create` and returning the handle has to delete the sandbox on
+  failure.** The caller's `finally` can only clean up what it was given, so a setup step
+  that raises leaks a *running* sandbox with no reference to it — and it fails identically
+  in every shard, so one bad clone leaked 24 at once. Both `provision` and
+  `start_fhir_sandbox` wrap their setup in `except BaseException: client.delete(...); raise`.
+- **A commit SHA cannot be cloned with `commit_id=`** unless it is on the default branch:
+  the server resolves it there and answers `Failed to clone repository: not found: object
+  not found`. `_fill_sandbox` clones the default branch and then
+  `git fetch --depth 1 origin <sha> && git checkout --detach FETCH_HEAD`, which works for
+  any commit GitHub will serve.
 - Credentials are uploaded as a `credentials.toml`, not passed as `env_vars`, so they stay
   out of sandbox metadata. `set_environment_variables()` exports every key of that file,
   which is also how `MEDAGENTBENCH_FHIR_URL` reaches the task module.

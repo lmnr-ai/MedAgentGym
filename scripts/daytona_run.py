@@ -339,13 +339,37 @@ def provision(client: Daytona, image, args: argparse.Namespace, creds: dict[str,
             timeout=1800,
             on_snapshot_create_logs=lambda line: print(f"[image] {line.rstrip()}"),
         )
+    try:
+        return _fill_sandbox(sandbox, args, creds, label)
+    except BaseException:
+        # Everything past `create` is setup, and the caller only gets the handle
+        # if this returns -- so a failure here leaks a running sandbox nobody
+        # holds a reference to. One bad `git clone` used to leak the whole run's
+        # worth of them at once.
+        if not args.keep_sandboxes:
+            print(f"[{label}] provisioning failed, deleting sandbox")
+            client.delete(sandbox)
+        raise
 
-    # Tags go on `branch=` -- `git clone --branch` takes either -- but a SHA has
-    # to go on `commit_id=`, which leaves the clone in detached HEAD. Hex is the
-    # only thing distinguishing them, so a branch named like a SHA would be
+
+def _fill_sandbox(sandbox, args: argparse.Namespace, creds: dict[str, str], label: str):
+    """Get the repo, its deps and the credentials into an already-created sandbox."""
+    # Tags go on `branch=` -- `git clone --branch` takes either. A SHA cannot go
+    # there, and `commit_id=` is not the answer either: the server resolves it
+    # against the default branch, so a commit that lives on a feature branch
+    # fails every sandbox with "object not found". Cloning the default branch and
+    # fetching the commit by hand works wherever it lives. Hex is the only thing
+    # distinguishing the two cases, so a branch named like a SHA would be
     # misread; `refs/heads/<name>` forces the branch reading if that ever bites.
     if COMMIT_RE.fullmatch(args.ref):
-        sandbox.git.clone(args.repo_url, REMOTE_REPO, commit_id=args.ref)
+        sandbox.git.clone(args.repo_url, REMOTE_REPO)
+        run_remote(
+            sandbox,
+            f"git fetch --depth 1 origin {shlex.quote(args.ref)} "
+            "&& git checkout --detach FETCH_HEAD",
+            timeout=600,
+            label=label,
+        )
     else:
         sandbox.git.clone(args.repo_url, REMOTE_REPO, branch=args.ref)
     # Nearly a no-op when the clone's lockfile matches the one baked into the
