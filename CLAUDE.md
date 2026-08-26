@@ -90,6 +90,16 @@ easy to get wrong:
 - A worker can exit without running interpreter shutdown hooks, so every rollout ends in a
   `tracing.flush()`.
 
+The root span carries the trajectory metadata (`trajectory_metadata` in `main.py`), in the
+schema shared across Laminar's trajectory datasets. Two traps:
+
+- **`gt_event_identified` is a failure flag, not a pass flag**: true when the trajectory did
+  not pass, false when it did, and true for a rollout that never reached a grader. It reads
+  like the opposite, and a run exported with the sense inverted is silently wrong.
+- `Laminar.set_trace_metadata` may be called **at most once per trace**, which is why it is
+  called from the `finally` of `run_single_rollout` and not at span start — `num_steps` and
+  the verdict are not known until the rollout ends, and a crashed one still needs metadata.
+
 To confirm delivery, read the spans back with `LaminarClient(project_api_key=...).sql.query`
 — e.g. `SELECT name, span_id, parent_span_id, path FROM spans WHERE trace_id = '...'`.
 Root spans have `parent_span_id = '00000000-0000-0000-0000-000000000000'`. This needs a
@@ -133,6 +143,10 @@ flags. The non-obvious parts:
   build context is uploaded, and the driver starts the war by hand with the argv that was
   the original image's `ENTRYPOINT`. Ready in ~2 minutes; wants 8 GB of RAM, and 10 GB of
   disk is the per-sandbox ceiling on the default plan (a 30 GB request is a 400).
+- **One FHIR sandbox per shard, not per run.** MedAgentBench's write tasks are graded on
+  what the agent POSTed, so a server shared across shards makes grading order-dependent.
+  `run_shard` starts its own and copies `creds` before writing `MEDAGENTBENCH_FHIR_URL` into
+  it — the dict comes from `main()` and is shared by every thread in the pool.
 - Readiness is polled from the *driver* against the public preview URL rather than with a
   `curl` inside the sandbox: that is the path the workers use, and the JRE image has no
   `curl`. `start_fhir_sandbox` deletes its own sandbox on any failure — the caller only

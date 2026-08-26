@@ -90,14 +90,16 @@ def history_path(save_dir, idx, rollout_idx, num_rollouts):
 def trajectory_metadata(args, config, idx, rollout_idx, result):
     """The trace metadata every trajectory carries, in the shared schema.
 
-    `gt_event_identified` is the eval verdict, and is deliberately absent rather
-    than `False` when the rollout never reached one — an abandoned trajectory is
-    neither a pass nor a fail, and scoring infrastructure failures as failures
-    would poison exactly the "what did the model get wrong" queries this is for.
+    `gt_event_identified` is a *failure* flag: true when the trajectory did not
+    pass, false when it did. A rollout that never reached a grader — the LLM
+    endpoint gave up, or the harness crashed — counts as a failure too, so this
+    is exactly `not success` and is never absent. `outcome` is what separates
+    the two kinds of failure.
     """
-    metadata = {
+    return {
         "source": args.task,
         "domain": "healthcare",
+        "gt_event_identified": not result["success"],
         "generated": True,
         "harness": HARNESS,
         "model": config["Agent"]["llm"]["model_name"],
@@ -113,9 +115,6 @@ def trajectory_metadata(args, config, idx, rollout_idx, result):
         "run_tag": args.result_dir_tag,
         "debugger_model": config["Debugger"]["model_name"],
     }
-    if result["graded"]:
-        metadata["gt_event_identified"] = bool(result["success"])
-    return metadata
 
 
 def run_single_rollout(args, config, idx, rollout_idx, output_path):
@@ -124,7 +123,7 @@ def run_single_rollout(args, config, idx, rollout_idx, output_path):
     # called at most once per trace, so it happens in the `finally` rather than
     # at span start: `num_steps` and the verdict are not known until the end,
     # and a trajectory that crashed should still be findable.
-    result = {"success": 0, "score": 0, "steps": 0, "reason": "crashed", "graded": False}
+    result = {"success": 0, "score": 0, "steps": 0, "reason": "crashed"}
     with Laminar.start_as_current_span(
         f"{args.task}[{args.mode}/{idx}]",
         input={"task": args.task, "mode": args.mode, "index": idx, "rollout": rollout_idx},
@@ -171,15 +170,11 @@ def _rollout(args, config, idx, output_path):
             if attempts >= config["Env"]["n_retry"]:
                 agent.conversation_history.append({"result": "failure"})
                 save_conversation_history(agent.conversation_history, output_path)
-                # `graded: False` — the API was unreachable, so nothing the
-                # agent did was ever put in front of a grader.
-                return {
-                    "success": 0,
-                    "score": 0,
-                    "steps": steps,
-                    "reason": action,
-                    "graded": False,
-                }
+                # The API was unreachable, so nothing the agent did was ever put
+                # in front of a grader. `reason` carries the LLM failure so the
+                # trajectory is still distinguishable from one that was graded
+                # and lost.
+                return {"success": 0, "score": 0, "steps": steps, "reason": action}
             time.sleep(1)
             action, params = agent.act(obs)
         obs, reward, done, _, _ = env.step(action, **params)
@@ -191,14 +186,11 @@ def _rollout(args, config, idx, output_path):
     else:
         agent.conversation_history.append({"result": "failure"})
     save_conversation_history(agent.conversation_history, output_path)
-    # Graded either way: exhausting the step budget means the grader kept
-    # saying no, which is a real verdict on the trajectory.
     return {
         "success": 1 if done else 0,
         "score": reward,
         "steps": steps,
         "reason": "solved" if done else "step budget exhausted",
-        "graded": True,
     }
 
 

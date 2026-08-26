@@ -208,7 +208,7 @@ then download the `workdir/` tree and delete the sandbox.
 | `--ref` | branch, tag or commit to clone (default `main`) — this is what pins the run |
 | `--indices-path` | run a fixed index list, e.g. `data/smoke_indices.json` |
 | `--snapshot NAME` | reuse a prebuilt Daytona snapshot instead of building the Dockerfile |
-| `--with-fhir` | start MedAgentBench's FHIR server as its own sandbox |
+| `--with-fhir` | give each shard its own MedAgentBench FHIR server sandbox |
 | `--keep-sandboxes` | leave sandboxes running so a failure can be inspected |
 
 Things worth knowing before the first run:
@@ -224,11 +224,15 @@ Things worth knowing before the first run:
 - **Your credentials are copied into every sandbox**, because that file is how the harness
   loads them. Use keys scoped to this work. Only the keys listed in `FORWARDED_KEYS` are
   sent, and they go in as a file rather than as sandbox environment variables.
-- **`--with-fhir` makes the FHIR sandbox public** for the life of the run, since the worker
-  sandboxes have to reach it over its preview URL and hold no Daytona token. It serves only
-  MedAgentBench's synthetic patients, but it is world-reachable while the run lasts, and
-  writes from one shard are visible to every other shard exactly as they are under
-  `docker run`. It comes up in ~2 minutes and is torn down with the workers.
+- **`--with-fhir` gives every shard its own FHIR server**, each starting from the image's
+  pristine database. A third of MedAgentBench's tasks POST to the server and are graded on
+  what they wrote, so a shared server would let one shard's writes show up in another's
+  reads. `--sandboxes` is therefore also the isolation knob: `--sandboxes 60` on the test
+  split is one clean server per task. Each one costs ~2 minutes of startup and 8 GB of RAM,
+  and is torn down with its worker.
+- **The FHIR sandboxes are public** for the life of the run, since the workers reach them
+  over their preview URLs and hold no Daytona token. They serve only MedAgentBench's
+  synthetic patients, but they are world-reachable while the run lasts.
 - **The FHIR sandbox is built from `Dockerfile.fhir`, not from `jyxsu6/medagentbench`
   directly.** That image is distroless — no shell, no coreutils — so Daytona's agent has
   nothing to run inside it and every exec fails with `failed to resolve container IP` even

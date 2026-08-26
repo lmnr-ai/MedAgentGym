@@ -7,9 +7,9 @@ Three problems this solves that a local run does not:
   the agent `pip install` into the venv it is being graded in. A sandbox is
   thrown away afterwards, so every rollout starts from the same clean tree.
 * **Docker.** MedAgentBench needs the HAPI FHIR server that upstream starts with
-  `docker run -p 8080:8080`. Here it is a *sandbox of its own* (built from
+  `docker run -p 8080:8080`. Here every shard gets one (built from
   `Dockerfile.fhir`), reached over its preview URL, so no Docker daemon is
-  needed anywhere -- `--with-fhir`.
+  needed anywhere and no shard sees another shard's writes -- `--with-fhir`.
 * **Throughput.** Task indices are sharded across sandboxes, each running its
   shard with joblib, so total concurrency is `--sandboxes` x `--n-jobs`. Rate
   limits, not CPU, are usually what caps this.
@@ -20,7 +20,7 @@ run is reproducible from a commit and nothing local leaks into the image.
 Credentials are read from the local `credentials.toml` and written into each
 sandbox, because that file is how the harness loads them. They therefore leave
 this machine: use keys scoped to this work. `--with-fhir` additionally marks the
-FHIR sandbox public, since the worker sandboxes have to reach it and hold no
+FHIR sandboxes public, since the worker sandboxes have to reach them and hold no
 Daytona token of their own.
 
 Usage:
@@ -147,7 +147,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--with-fhir",
         action="store_true",
-        help="start a HAPI FHIR sandbox and point the workers at it (MedAgentBench only)",
+        help="give each shard its own HAPI FHIR sandbox (MedAgentBench only)",
     )
     parser.add_argument(
         "--keep-sandboxes", action="store_true", help="skip cleanup, to inspect a failure"
@@ -235,23 +235,29 @@ def run_detached(sandbox, argv: list[str], timeout: int, label: str) -> int:
     raise RuntimeError(f"[{label}] shard did not finish within {timeout}s")
 
 
-def start_fhir_sandbox(client: Daytona, args: argparse.Namespace):
+def start_fhir_sandbox(client: Daytona, args: argparse.Namespace, label: str):
     """Bring up MedAgentBench's FHIR server as its own sandbox.
 
     This replaces upstream's `data/medagentbench/start_eval_docker.sh`: the
     `docker run` becomes a sandbox and the published port becomes a preview URL.
 
+    One per shard, not one per run: a third of MedAgentBench's tasks POST to the
+    server, and grading reads back what the agent wrote. Sharing a server across
+    shards would let one shard's writes land in another shard's reads, so each
+    shard starts from the image's pristine database and sees only itself.
+
     The sandbox is public because the workers have to reach it and carry no
     Daytona token; it holds only MedAgentBench's synthetic patients, but it is
     world-reachable for the life of the run.
     """
-    print("[fhir] building sandbox image from Dockerfile.fhir ...")
+    label = f"{label}/fhir"
+    print(f"[{label}] building sandbox image from Dockerfile.fhir ...")
     sandbox = client.create(
         CreateSandboxFromImageParams(
             image=Image.from_dockerfile(REPO_DIR / "Dockerfile.fhir"),
             public=True,
             os_user="root",
-            labels={"medagentgym": "fhir"},
+            labels={"medagentgym": "fhir", "shard": label},
             # HAPI is a JVM holding a ~1.4 GB H2 database open, so it wants more
             # RAM than a worker; 10 GB of disk is the per-sandbox ceiling on the
             # default Daytona plan and is enough for the image.
@@ -274,7 +280,7 @@ def start_fhir_sandbox(client: Daytona, args: argparse.Namespace):
             timeout=60,
         )
         url = sandbox.get_preview_link(FHIR_PORT).url.rstrip("/") + "/fhir/"
-        print(f"[fhir] waiting for {url} ...")
+        print(f"[{label}] waiting for {url} ...")
         # Polled from here rather than with a `curl` inside the sandbox: this is
         # the same public preview URL the workers will use, so a 200 here proves
         # the path that actually matters, and the JRE image has no curl anyway.
@@ -283,7 +289,7 @@ def start_fhir_sandbox(client: Daytona, args: argparse.Namespace):
             try:
                 with urllib.request.urlopen(f"{url}metadata", timeout=30) as resp:
                     if resp.status == 200:
-                        print(f"[fhir] ready at {url}")
+                        print(f"[{label}] ready at {url}")
                         return sandbox, url
             except (urllib.error.URLError, TimeoutError, OSError):
                 pass
@@ -296,7 +302,7 @@ def start_fhir_sandbox(client: Daytona, args: argparse.Namespace):
         # anything that escapes has to take the sandbox with it or it leaks --
         # a stopped-but-billed container nobody has a handle on.
         if not args.keep_sandboxes:
-            print("[fhir] startup failed, deleting sandbox")
+            print(f"[{label}] startup failed, deleting sandbox")
             client.delete(sandbox)
         raise
 
@@ -361,7 +367,14 @@ def run_shard(client: Daytona, image, args: argparse.Namespace, creds: dict[str,
               indices: list[int], label: str) -> dict:
     """Provision a sandbox, run its shard, and bring the trajectories home."""
     sandbox = None
+    fhir_sandbox = None
     try:
+        if args.with_fhir:
+            fhir_sandbox, fhir_url = start_fhir_sandbox(client, args, label)
+            # Copied rather than mutated: the caller's dict is shared with every
+            # other shard, each of which is pointed at a different server.
+            creds = {**creds, "MEDAGENTBENCH_FHIR_URL": fhir_url}
+
         print(f"[{label}] provisioning for {len(indices)} tasks ...")
         sandbox = provision(client, image, args, creds, label)
 
@@ -410,11 +423,12 @@ def run_shard(client: Daytona, image, args: argparse.Namespace, creds: dict[str,
         print(f"[{label}] FAILED: {e}")
         return {"label": label, "tasks": len(indices), "ok": False, "error": str(e)}
     finally:
-        if sandbox and not args.keep_sandboxes:
-            try:
-                client.delete(sandbox)
-            except DaytonaError as e:
-                print(f"[{label}] could not delete sandbox: {e}")
+        for doomed in (sandbox, fhir_sandbox):
+            if doomed and not args.keep_sandboxes:
+                try:
+                    client.delete(doomed)
+                except DaytonaError as e:
+                    print(f"[{label}] could not delete sandbox: {e}")
 
 
 def main() -> None:
@@ -441,23 +455,14 @@ def main() -> None:
     client = Daytona(DaytonaConfig(api_key=os.environ["DAYTONA_API_KEY"]))
     image = None if args.snapshot else Image.from_dockerfile(REPO_DIR / "Dockerfile.daytona")
 
-    fhir_sandbox = None
     started = time.time()
-    try:
-        if args.with_fhir:
-            fhir_sandbox, fhir_url = start_fhir_sandbox(client, args)
-            creds["MEDAGENTBENCH_FHIR_URL"] = fhir_url
-
-        with ThreadPoolExecutor(max_workers=len(shards)) as pool:
-            results = list(
-                pool.map(
-                    lambda pair: run_shard(client, image, args, creds, pair[1], f"shard-{pair[0]}"),
-                    enumerate(shards),
-                )
+    with ThreadPoolExecutor(max_workers=len(shards)) as pool:
+        results = list(
+            pool.map(
+                lambda pair: run_shard(client, image, args, creds, pair[1], f"shard-{pair[0]}"),
+                enumerate(shards),
             )
-    finally:
-        if fhir_sandbox and not args.keep_sandboxes:
-            client.delete(fhir_sandbox)
+        )
 
     ok = [r for r in results if r["ok"]]
     print("-" * 50)
