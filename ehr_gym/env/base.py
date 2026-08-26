@@ -1,6 +1,8 @@
 import json
 import logging
 import re
+import shutil
+import tempfile
 import time
 from abc import ABC
 from typing import Callable, Optional
@@ -9,6 +11,7 @@ import gymnasium as gym
 from lmnr import Laminar
 
 from ehr_gym.env.action.action_set import ACTION_SET
+from ehr_gym.env.action.function import set_workspace
 from ehr_gym.env.chat import Chat
 from ehr_gym.env.spaces import AnyDict, Float, Unicode
 from ehr_gym.env.task.base import AbstractEHRTask
@@ -75,14 +78,31 @@ class EHREnv(gym.Env, ABC):
         self.debugger = make_chat_model(self.task_kwargs.get("debugger_config"))
         self.env_history = []
         self.need_context = False
+        # Scratch directory the agent's code runs in, one per task. See
+        # `ehr_gym.env.action.function` for what it isolates.
+        self.workspace = None
+
+    def _open_workspace(self):
+        """Give the task a private directory to run code in, and point the actions at it."""
+        self._close_workspace()
+        self.workspace = tempfile.mkdtemp(prefix="medagentgym-rollout-")
+        set_workspace(self.workspace)
+
+    def _close_workspace(self):
+        """Throw the task's scratch directory away, whatever it left in there."""
+        set_workspace(None)
+        if self.workspace:
+            shutil.rmtree(self.workspace, ignore_errors=True)
+            self.workspace = None
 
     def close(self):
         if self.task:
             self.task.teardown()
             self.task = None
+        self._close_workspace()
         self.chat = None
         self.env_history = []
-    
+
     def reset(self, task_id, *args, **kwargs):
         """
         Reset the environment to a new task.
@@ -94,7 +114,12 @@ class EHREnv(gym.Env, ABC):
             self.task = None
         self.chat = None
         self.env_history = []
-        
+
+        # Before the task is built, not after: `BiocoderTask.setup` runs the
+        # reference program to derive the ground truth, and that execution belongs
+        # to this task's workspace like any other.
+        self._open_workspace()
+
         # create a new task
         self.task = self.task_entrypoint(task_id=task_id, **self.task_kwargs)
 

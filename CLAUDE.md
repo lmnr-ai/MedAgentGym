@@ -54,10 +54,20 @@ Only four datasets remain: `biocoder`, `biodsbench`, `medagentbench`, `medcalcbe
 - `credentials.toml` is gitignored; copy `credentials.example.toml`. Every top-level key in
   it is exported verbatim as an environment variable by `set_environment_variables()`.
 - No CUDA and no `torch` — we only call hosted APIs. Don't reintroduce a GPU base image.
-- **Agent code executes with `cwd` = repo root** and freely writes files there
-  (`test.bam`, `output/`, `STAR`, …). Run experiments from a scratch directory, or expect
-  to `git clean -fd` afterwards. Anything *we* write that runs scraped task code should go
-  through `scripts/_common.run_python`, which uses a temp cwd.
+- **Agent code runs in a per-task scratch directory, never in the repo root.** `EHREnv.reset`
+  creates one (`medagentgym-rollout-*` under the system temp dir) and `EHREnv.close` deletes
+  it, with `ehr_gym.env.action.function.set_workspace` pointing the actions at it. That is
+  what makes it safe for one sandbox to run hundreds of tasks in a row: task code writes
+  `test.bam` / `output/` / `STAR` wherever it likes and none of it reaches task N+1. Two
+  consequences worth knowing:
+  - `_rollout` must `env.close()` in a `finally` — the workspace is otherwise leaked, and
+    with it the isolation guarantee.
+  - Paths handed to agent code must be **absolute** (see `BioDSBenchTask.setup`), because
+    the harness's cwd is the repo root but the agent's cwd is not.
+- `terminal` installs land in `<workspace>/.packages` via `PIP_TARGET`, on `PYTHONPATH` for
+  the agent's own processes only, so `pip install numpy==1.19` in one task cannot decide
+  what the next task imports. Anything *we* write that runs scraped task code should go
+  through `scripts/_common.run_python`, which uses a temp cwd for the same reason.
 
 ## Calling models
 

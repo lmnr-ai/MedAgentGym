@@ -100,7 +100,10 @@ class BioDSBenchTask(AbstractEHRTask):
                     self.task_list.append(json.loads(line))
         task_data = self.task_list[self.task_id]
         self.study_id = str(task_data['study_ids'])
-        self.dataset_path = os.path.join(self.data_path, 'data', self.study_id)
+        # Absolute: the questions, the setup code and the assertions all carry this
+        # path into code that runs in the rollout's own scratch directory, not in
+        # the repo root.
+        self.dataset_path = os.path.abspath(os.path.join(self.data_path, 'data', self.study_id))
         if not os.path.isdir(self.dataset_path):
             raise FileNotFoundError(
                 f"No data for study {self.study_id} at {self.dataset_path}. "

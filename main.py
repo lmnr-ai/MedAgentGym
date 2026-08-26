@@ -152,6 +152,16 @@ def _rollout(args, config, idx, output_path):
         },
     )
     agent = EHRAgent(agent_config, permitted_actions=task_cls.permitted_actions)
+    try:
+        return _run_task(args, config, idx, output_path, env, agent)
+    finally:
+        # Drops the task's scratch directory. A sandbox runs hundreds of tasks in
+        # sequence, so anything the agent wrote or installed has to go with it.
+        env.close()
+
+
+def _run_task(args, config, idx, output_path, env, agent):
+    agent_config = config["Agent"]
     obs, _ = env.reset(idx)
 
     attempts = 0

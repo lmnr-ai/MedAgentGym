@@ -16,21 +16,61 @@ logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path("./cache")
 CODE_TIMEOUT_SECONDS = 120
+# Where `pip install` puts things when the agent runs it, relative to the workspace.
+SITE_DIR = ".packages"
+
+# Scratch directory of the rollout currently running. Everything the agent does to
+# the filesystem -- files its code writes, packages it installs from `terminal` --
+# is confined here and thrown away when the rollout ends, so one sandbox can run
+# hundreds of tasks back to back without task N leaking into task N+1. `EHREnv`
+# owns the lifecycle; it is a module global rather than an action parameter because
+# `BiocoderTask.setup` also runs code (the reference program, whose stdout is the
+# ground truth) and has to land in the same place. Safe because rollouts are never
+# concurrent inside one process: joblib parallelism here is `prefer="processes"`.
+_WORKSPACE: Path | None = None
+
+
+def set_workspace(path: Path | None) -> None:
+    global _WORKSPACE
+    _WORKSPACE = Path(path) if path is not None else None
+
+
+def current_workspace() -> Path:
+    """The directory agent code runs in. Falls back to the cache dir when no env owns it."""
+    work = _WORKSPACE if _WORKSPACE is not None else CACHE_DIR
+    work.mkdir(parents=True, exist_ok=True)
+    return work
+
+
+def _agent_env(work: Path) -> dict[str, str]:
+    """Environment for a subprocess of the agent's making."""
+    env = os.environ.copy()
+    site = work / SITE_DIR
+    # `pip install numpy==1.19` from one task must not decide what the next task
+    # imports, so installs go to a per-rollout directory that is on the path of
+    # the agent's own processes only.
+    env["PIP_TARGET"] = str(site)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(site)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+    )
+    return env
 
 
 def _run_code_file(code_file: Path, timeout: int) -> tuple[int, str, str, float]:
     start_time = time.time()
+    work = code_file.parent
     try:
         # `sys.executable`, not `"python"`: the BioCoder ground truth is produced by
         # running the reference in *this* interpreter at setup time, so grading is
         # only meaningful if the agent's code sees the same site-packages. Resolving
         # `python` through PATH silently picks up whatever venv the shell activated.
         process = subprocess.run(
-            [sys.executable, str(code_file)],
+            [sys.executable, code_file.name],
             capture_output=True,
             text=True,
             timeout=timeout,
-            env=os.environ.copy(),
+            cwd=work,
+            env=_agent_env(work),
         )
         return process.returncode, process.stdout, process.stderr, time.time() - start_time
     except subprocess.TimeoutExpired:
@@ -68,9 +108,8 @@ def validate_code(code: str) -> dict[str, Any]:
             "execution_time": f"{time.time() - start_time:.2f}s",
         }
 
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    code_file = CACHE_DIR / f"validation_code_{timestamp}_{uuid.uuid4()}.py"
+    code_file = current_workspace() / f"validation_code_{timestamp}_{uuid.uuid4()}.py"
     if "print" not in code and "answer" in code:
         code += "\nprint(answer)"
     code_file.write_text(code)
@@ -148,11 +187,14 @@ def terminal(cmd: str) -> dict[str, Any]:
         terminal("pip install pysam")
     """
     start_time = time.time()
+    work = current_workspace()
     # `pip install ...` is the whole point of this action, so make `pip` and
     # `python` mean the interpreter that will later run the agent's code.
-    env = os.environ.copy()
+    env = _agent_env(work)
     env["PATH"] = os.pathsep.join([str(Path(sys.executable).parent), env.get("PATH", "")])
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
+    result = subprocess.run(
+        cmd, shell=True, capture_output=True, text=True, cwd=work, env=env
+    )
     execution_time = time.time() - start_time
     if result.returncode == 0:
         return {
